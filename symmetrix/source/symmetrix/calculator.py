@@ -657,7 +657,10 @@ class Symmetrix(Calculator):
         their adjoints and requires M1 polynomial recomputation. It is an
         expert policy and is incompatible with execution observers and
         parameter gradients. Prefer ``low_memory=True`` for the supported
-        policy bundle.
+        policy bundle. Throughput-qualified direct models apply the
+        ``reuse-adjoints-v1`` storage policy under both execution profiles;
+        enabling execution observers or parameter gradients forces
+        ``full-retention-v1``.
     edge_geometry_policy : {"cartesian-f64-v1", "unit-f32-radius-f64-v1"}, default="cartesian-f64-v1"
         Active edge-geometry representation for ordinary factorized inference.
         ``unit-f32-radius-f64-v1`` retains float32 unit directions and float64
@@ -1386,6 +1389,22 @@ class Symmetrix(Calculator):
             raise ValueError(f"m1_polynomial_policy must be one of {choices}.")
         return policy
 
+    @staticmethod
+    def _apply_default_policy(setter, request):
+        """Apply a construction-time default that the bundle may override.
+
+        Kokkos evaluators take a ``pin`` flag on their ``_set_*_policy`` hooks:
+        a pinned request keeps its value across the automatic throughput
+        bundle, while the defaults applied here must stay overridable. An
+        evaluator without the flag (test doubles, legacy evaluators) accepts
+        the request alone.
+        """
+
+        try:
+            setter(request, pin=False)
+        except TypeError:
+            setter(request)
+
     def _configure_m1_polynomial_policy(self):
         setter = getattr(self.evaluator, "_set_m1_polynomial_policy", None)
         request = self.m1_polynomial_policy_request
@@ -1399,7 +1418,7 @@ class Symmetrix(Calculator):
                 "m1_polynomial_policy='recompute' requires a compatible "
                 "Kokkos MACE evaluator."
             )
-        setter(request)
+        self._apply_default_policy(setter, request)
         self.m1_polynomial_policy = str(
             getattr(self.evaluator, "m1_polynomial_policy", request)
         )
@@ -1419,7 +1438,7 @@ class Symmetrix(Calculator):
                 "execution_mh0_state_policy='reuse-adjoints-v1' requires a "
                 "compatible Kokkos MACE evaluator."
             )
-        setter(request)
+        self._apply_default_policy(setter, request)
         self.mh0_state_policy = str(
             getattr(self.evaluator, "mh0_state_policy", request)
         )
@@ -1435,7 +1454,7 @@ class Symmetrix(Calculator):
                 "edge_geometry_policy='unit-f32-radius-f64-v1' requires a "
                 "compatible Kokkos MACE evaluator."
             )
-        setter(self.edge_geometry_policy)
+        self._apply_default_policy(setter, self.edge_geometry_policy)
         self.edge_geometry_policy = str(
             getattr(self.evaluator, "edge_geometry_policy", self.edge_geometry_policy)
         )
@@ -3660,9 +3679,11 @@ class Symmetrix(Calculator):
 
         field_derivatives_computed = False
         force_derivatives_computed = False
+        force_derivative_bins = False
 
         def compute_field_derivatives(include_forces=False):
             nonlocal field_derivatives_computed, force_derivatives_computed
+            nonlocal force_derivative_bins
             if include_forces and force_derivatives_computed:
                 return
             if field_derivatives_computed and not include_forces:
@@ -3681,24 +3702,26 @@ class Symmetrix(Calculator):
                     self._macefield_response_graph_generation,
                     field,
                     include_forces,
+                    scatter_bec_bins=include_forces,
                 )
                 field_derivatives_computed = True
                 force_derivatives_computed = include_forces
+                force_derivative_bins = include_forces
                 return
 
             num_nodes, node_types, num_neigh, j_list, neigh_types, xyz, r, _ = (
                 mace_inputs
             )
             if include_forces:
+                compute_current_bins = getattr(
+                    self.evaluator,
+                    "_compute_current_electric_field_bec_bins",
+                    None,
+                )
                 compute_current_response = getattr(
                     self.evaluator,
                     "_compute_current_electric_field_force_derivative",
                     None,
-                )
-                compute_response = (
-                    compute_current_response
-                    if callable(compute_current_response)
-                    else self.evaluator.compute_electric_field_force_derivative
                 )
                 response_args = (
                     num_nodes,
@@ -3710,13 +3733,21 @@ class Symmetrix(Calculator):
                     r,
                     field,
                 )
-                if callable(compute_current_response):
-                    compute_response(
+                if callable(compute_current_bins):
+                    compute_current_bins(
+                        *response_args,
+                        self._macefield_response_graph_generation,
+                    )
+                    force_derivative_bins = True
+                elif callable(compute_current_response):
+                    compute_current_response(
                         *response_args,
                         self._macefield_response_graph_generation,
                     )
                 else:
-                    compute_response(*response_args)
+                    self.evaluator.compute_electric_field_force_derivative(
+                        *response_args
+                    )
                 field_derivatives_computed = True
                 force_derivatives_computed = True
             else:
@@ -3761,23 +3792,28 @@ class Symmetrix(Calculator):
 
         if "becs" in properties:
             compute_field_derivatives(include_forces=True)
-            num_nodes, _, _, j_list, _, xyz, _, i_list = mace_inputs
-            pair_derivatives = np.asarray(
-                self.evaluator.electric_field_force_derivative,
-                dtype=float,
-            ).reshape(3, -1, 3)[:, : len(i_list), :]
-            becs = np.zeros((len(atoms), 3, 3))
-            for field_component in range(3):
-                for cartesian in range(3):
-                    becs[:, field_component, cartesian] = np.bincount(
-                        j_list,
-                        weights=pair_derivatives[field_component, :, cartesian],
-                        minlength=num_nodes,
-                    ) - np.bincount(
-                        i_list,
-                        weights=pair_derivatives[field_component, :, cartesian],
-                        minlength=num_nodes,
-                    )
+            if force_derivative_bins:
+                becs = np.array(
+                    self.evaluator.electric_field_bec_bins, dtype=float, copy=True
+                ).reshape(len(atoms), 3, 3)
+            else:
+                num_nodes, _, _, j_list, _, xyz, _, i_list = mace_inputs
+                pair_derivatives = np.asarray(
+                    self.evaluator.electric_field_force_derivative,
+                    dtype=float,
+                ).reshape(3, -1, 3)[:, : len(i_list), :]
+                becs = np.zeros((len(atoms), 3, 3))
+                for field_component in range(3):
+                    for cartesian in range(3):
+                        becs[:, field_component, cartesian] = np.bincount(
+                            j_list,
+                            weights=pair_derivatives[field_component, :, cartesian],
+                            minlength=num_nodes,
+                        ) - np.bincount(
+                            i_list,
+                            weights=pair_derivatives[field_component, :, cartesian],
+                            minlength=num_nodes,
+                        )
             results["becs"] = becs.reshape(len(atoms), 9)
 
         return results
@@ -3880,6 +3916,21 @@ class Symmetrix(Calculator):
             )
         return results
 
+    def _becs_requires_host_neighbor_graph(self, properties):
+        """Report whether BEC assembly still needs host receiver/source lists.
+
+        The device-bins reduction owns BEC accumulation natively, so only the
+        legacy pair-derivative fallback (evaluators without the bins API)
+        consumes host edge geometry.
+        """
+        if "becs" not in properties:
+            return False
+        bins = getattr(self.evaluator, "_compute_current_electric_field_bec_bins", None)
+        prepared_response = getattr(
+            self.evaluator, "_compute_prepared_factorized_field_response", None
+        )
+        return not (callable(bins) and callable(prepared_response))
+
     def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
         Calculator.calculate(self, atoms, properties, system_changes)
 
@@ -3896,7 +3947,9 @@ class Symmetrix(Calculator):
             mace_inputs = self._mace_inputs(
                 self.atoms,
                 native_geometry=True,
-                allow_device_neighbor_graph="becs" not in evaluation_properties,
+                allow_device_neighbor_graph=(
+                    not self._becs_requires_host_neighbor_graph(evaluation_properties)
+                ),
             )
         else:
             mace_inputs = self._mace_inputs(self.atoms)
@@ -3934,7 +3987,9 @@ class Symmetrix(Calculator):
             mace_inputs = self._mace_inputs(
                 self.atoms,
                 native_geometry=True,
-                allow_device_neighbor_graph="becs" not in evaluation_properties,
+                allow_device_neighbor_graph=(
+                    not self._becs_requires_host_neighbor_graph(evaluation_properties)
+                ),
             )
             (
                 num_nodes,

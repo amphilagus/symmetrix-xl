@@ -29,16 +29,55 @@ from pathlib import Path
 
 def _early_execution_environment():
     # Set affinity before NumPy, BLAS, PyTorch or Kokkos can create workers.
-    record = {"policy": "one logical CPU; its SMT siblings excluded"}
+    early = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    early.add_argument("--cpu-threads", type=int, default=1)
+    early.add_argument("--device", default="cpu")
+    options, _ = early.parse_known_args()
+    threads = options.cpu_threads
+    if threads < 1 or (
+        threads != 1 and (sys.argv[1:2] != ["md"] or options.device != "cpu")
+    ):
+        raise ValueError(
+            "--cpu-threads >1 is supported only for CPU md correctness runs"
+        )
+    record = {
+        "policy": "one logical CPU per physical core; SMT siblings excluded",
+        "requested_threads": threads,
+        "formal_benchmark_threads": 1,
+    }
     if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
         allowed = sorted(os.sched_getaffinity(0))
         selected = allowed[0]
-        os.sched_setaffinity(0, {selected})
+        chosen, physical = [], set()
+        for logical in allowed:
+            directory = Path(f"/sys/devices/system/cpu/cpu{logical}/topology")
+            package = directory / "physical_package_id"
+            core = directory / "core_id"
+            if not (package.is_file() and core.is_file()):
+                if threads > 1:
+                    raise RuntimeError(
+                        "CPU MD threads require verified physical-core topology"
+                    )
+                chosen = [selected]
+                break
+            identity = (package.read_text().strip(), core.read_text().strip())
+            if identity not in physical:
+                chosen.append(logical)
+                physical.add(identity)
+            if len(chosen) == threads:
+                break
+        if len(chosen) != threads:
+            raise RuntimeError(
+                f"Requested {threads} CPU MD cores, allocation has {len(chosen)}"
+            )
+        os.sched_setaffinity(0, set(chosen))
         topology = Path(f"/sys/devices/system/cpu/cpu{selected}/topology")
         record.update(
             applied=True,
             allowed_before=allowed,
             selected_logical_cpu=selected,
+            selected_logical_cpus=chosen,
+            selected_physical_cores=sorted(physical),
             allowed_after=sorted(os.sched_getaffinity(0)),
             physical_topology={
                 name: (topology / name).read_text().strip()
@@ -48,6 +87,8 @@ def _early_execution_environment():
             },
         )
     else:
+        if threads > 1:
+            raise RuntimeError("CPU MD threads require OS affinity support")
         record.update(
             applied=False,
             reason="OS lacks sched_setaffinity; not a qualified Linux CPU timing",
@@ -61,6 +102,9 @@ def _early_execution_environment():
         "NUMEXPR_NUM_THREADS",
     ):
         os.environ[name] = "1"
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["KOKKOS_NUM_THREADS"] = str(threads)
+    os.environ["OMP_MAX_ACTIVE_LEVELS"] = "1"
     return record
 
 
@@ -584,6 +628,16 @@ def provenance(args, calculator=None, executor=None):
                 extension_sha256=sha256(path),
                 native_build_info=calculator.native_build_info,
             )
+            if space == "OpenMP":
+                runtime = dict(native._openmp_runtime_info())
+                result["actual_executor"]["openmp_runtime"] = runtime
+                if (
+                    runtime.get("kokkos_concurrency")
+                    != EARLY_EXECUTION_ENVIRONMENT["requested_threads"]
+                ):
+                    raise RuntimeError(
+                        "Native concurrency differs from the recorded CPU policy"
+                    )
         else:
             result["actual_executor"].update(
                 model_classes=[
@@ -1447,6 +1501,12 @@ def parser():
             help="Maximum force-component tolerance, eV/A",
         )
         if name == "md":
+            sub.add_argument(
+                "--cpu-threads",
+                type=int,
+                default=1,
+                help="CPU correctness MD only; distinct physical cores, BLAS stays one thread. Formal benchmarks always use one core.",
+            )
             sub.add_argument("--steps", type=int, default=100)
             sub.add_argument("--sample-interval", type=int, default=10)
         sub.set_defaults(function=function)

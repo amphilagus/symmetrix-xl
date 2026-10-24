@@ -240,3 +240,58 @@ peaks are labeled separately. Missing counters remain unavailable. `report`
 summarizes worker JSON files only after checking that their physical inputs,
 protocols, paired initial states, and repeat identities agree. All result paths
 are explicitly selected with `--output`; generated data are not source artifacts.
+
+The paired GPU pipeline `deployment/polar/qualify_gpu_pair.sbatch` runs both
+profiles in one allocation containing three GPUs, including an SM80 and an
+SM90. Deploy the reviewed source and matching profile builds first, then submit:
+
+```bash
+sbatch --output="$DEPLOYMENT_ROOT/logs/polar-gpu-pair-%j.out" \
+    deployment/polar/qualify_gpu_pair.sbatch "$DEPLOYMENT_ROOT"
+```
+
+The wrapper defaults to the `compute` partition, three GPUs, four logical CPUs,
+192 GB RAM, and 24 hours; site scheduler options can be overridden on the
+`sbatch` command line. It selects only devices already listed in Slurm's
+`CUDA_VISIBLE_DEVICES`, preserves each selected original token, and gives each
+profile a single visible GPU at logical ordinal zero. Two distinct physical
+CPU cores are required; their SMT siblings are excluded. The profiles run
+concurrently with separate CPU affinities, GPUs, interpreters, and backends.
+
+The default inputs are `benchmark/prepared-reference/waterXXXX.prepare.json`
+and `.equilibrated.extxyz` under the deployment root. All four preparations
+must have passed optimization and 500-step NVT, use the same checkpoint, and
+match their recorded file and velocity hashes. Each profile runs the four
+geometry validations, then 64-water NVE for 100 and 1000 steps, then all four
+sizes with three independent original and candidate timing workers per size,
+each timed for at least ten seconds. Both NVE runs start from the same prepared
+state. Energy, force, regional-force, and initial/two-update charge/spin
+thresholds remain those above. Drift is recorded without a new drift threshold.
+The pipeline verifies actual native Cuda execution and FP64 DLPack features.
+
+Results use `benchmark/qualification/<profile>/waterXXXX/{validation,md100,md1000}`
+and `benchmark/performance/<profile>/waterXXXX/summary.json`; only the 64-water
+case has the two MD directories. GPU selection, physical CPU topology, command
+logs, planned and completed stages, and failures are saved in
+`benchmark/gpu-pair/<job-id>`. A failed stage stops its profile; the other
+profile can finish, and the allocation returns a failure status. Existing
+nonempty result directories are rejected. A deliberate rerun can pass
+`--output-root /absolute/path/new-results`; `--prepared` and `--checkpoint`
+also accept explicit paths. No stages are skipped or marked passed from an
+older run.
+
+`benchmarks/polar_qualification_report.py` reads deployment evidence without
+running models or tests. Its `--output` must be outside a Git checkout. The
+report prefers the separately built `cpu-omp` profile for formal CPU results
+and requires `manifests/build/cpu-omp/doctor-torch-polar.json` to show a strict
+`ok` result after real Torch/native POLAR energy and force evaluation. Older
+`cpu` trajectories and diagnostic timings remain labeled separately. The
+report preserves full-suite failures and skips, compares matching failures
+with a pristine upstream baseline when available, and distinguishes archived
+JUnit attempts from each profile's current qualification run.
+
+CPU MD correctness runs can explicitly use `md --cpu-threads 8` when the
+allocation provides eight physical cores. The driver applies affinity before
+numerical imports, excludes SMT siblings, uses eight Kokkos/OpenMP threads and
+one BLAS thread, and verifies actual native concurrency. GPU calculations and
+all formal `benchmark`/`_worker` throughput runs require one CPU thread.

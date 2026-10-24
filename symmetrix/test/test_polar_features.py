@@ -59,6 +59,30 @@ def _backbone_oracle(model, graph):
     return outputs, seeds, spherical_vectors, -gradient
 
 
+def _native_feature_inputs(graph, spherical_vectors=None):
+    from mace.modules.utils import get_edge_vectors_and_lengths
+
+    if spherical_vectors is None:
+        vectors, _ = get_edge_vectors_and_lengths(
+            graph["positions"], graph["edge_index"], graph["shifts"]
+        )
+        spherical_vectors = vectors[:, [1, 2, 0]]
+    source, receiver = graph["edge_index"].cpu().numpy()
+    order = np.argsort(receiver, kind="stable")
+    node_types = graph["node_attrs"].argmax(dim=1).cpu().numpy().astype(np.int32)
+    neighbors = source[order].astype(np.int32)
+    vectors = spherical_vectors.detach().cpu().numpy()[order]
+    return (
+        len(node_types),
+        node_types,
+        np.bincount(receiver, minlength=len(node_types)).astype(np.int32),
+        neighbors,
+        node_types[neighbors],
+        np.ascontiguousarray(vectors.reshape(-1)),
+        np.linalg.norm(vectors, axis=1),
+    )
+
+
 def _make_native_feature_case(model, atoms, tmp_path):
     """Construct the same independent prefix/VJP oracle for any real model."""
     import symmetrix
@@ -72,20 +96,8 @@ def _make_native_feature_case(model, atoms, tmp_path):
     native = symmetrix.load_backend().MACENonlinearKokkos(str(path))
     graph = _batch(model, atoms)
     outputs, seeds, xyz, negative_gradient = _backbone_oracle(model, graph)
-    source, receiver = graph["edge_index"].cpu().numpy()
-    order = np.argsort(receiver, kind="stable")
-    node_types = graph["node_attrs"].argmax(dim=1).cpu().numpy().astype(np.int32)
-    neighbors = source[order].astype(np.int32)
-    vectors = xyz.detach().cpu().numpy()[order]
-    inputs = (
-        len(atoms),
-        node_types,
-        np.bincount(receiver, minlength=len(atoms)).astype(np.int32),
-        neighbors,
-        node_types[neighbors],
-        np.ascontiguousarray(vectors.reshape(-1)),
-        np.linalg.norm(vectors, axis=1),
-    )
+    inputs = _native_feature_inputs(graph, xyz)
+    order = np.argsort(graph["edge_index"][1].cpu().numpy(), kind="stable")
     return (
         native,
         inputs,
@@ -167,12 +179,75 @@ def test_real_h512_s_features_and_arbitrary_seed_vjp(
             atol=1e-9,
         )
     )
+    # This is the negative coordinate derivative of a random feature scalar,
+    # not a physical energy force. Keep the strict feature/VJP tolerances.
+    # The probe omits E0, avoiding subtraction of large atomic reference energies.
+    edge_negative_gradient = np.asarray(native.node_forces).reshape(-1, 3)[:, [2, 0, 1]]
+    atomic_negative_gradient = np.zeros((len(lithium_water), 3))
+    receivers = np.repeat(np.arange(len(lithium_water)), inputs[2])
+    np.add.at(atomic_negative_gradient, receivers, edge_negative_gradient)
+    np.add.at(atomic_negative_gradient, inputs[3], -edge_negative_gradient)
+    seed_arrays = [value.numpy() for value in seeds]
+
+    def feature_probe(atoms):
+        # Only rebuild geometry. Reuse the checkpoint, serialized prefix and
+        # evaluator; no original Torch interaction/product forward is needed.
+        moved_inputs = _native_feature_inputs(_batch(model, atoms))
+        moved_token = native._forward_features(*moved_inputs)
+        return sum(
+            float(np.sum(value * seed, dtype=np.float64))
+            for value, seed in zip(
+                native._feature_arrays(moved_token), seed_arrays, strict=True
+            )
+        )
+
+    step = 1e-3
+    coordinate_probes = []
+    for atom, axis in ((0, 0), (1, 1), (2, 2)):  # Li/x, O/y, H/z
+        values = []
+        for offset in (-2, -1, 1, 2):
+            moved = lithium_water.copy()
+            moved.positions[atom, axis] += offset * step
+            values.append(feature_probe(moved))
+        # Negative of the five-point central derivative, matching native VJP sign.
+        finite_difference = (values[3] - 8 * values[2] + 8 * values[1] - values[0]) / (
+            12 * step
+        )
+        coordinate_probes.append(
+            {
+                "atom": atom,
+                "atomic_number": int(lithium_water.numbers[atom]),
+                "axis": axis,
+                "probe_at_offsets_minus2_minus1_plus1_plus2": values,
+                "analytic_negative_coordinate_gradient": float(
+                    atomic_negative_gradient[atom, axis]
+                ),
+                "finite_difference_negative_coordinate_gradient": finite_difference,
+            }
+        )
+        comparisons.append(
+            _oracle_comparison(
+                [atomic_negative_gradient[atom, axis]],
+                [finite_difference],
+                label=f"coordinate_FD_random_feature_probe_atom{atom}_axis{axis}",
+                rtol=1e-7,
+                atol=1e-9,
+            )
+        )
     with path.open("rb") as stream:
         checkpoint_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
     report = {
         "checkpoint_sha256": checkpoint_sha256,
         "native_class": type(native).__name__,
         "random_seed": 8713,
+        "coordinate_finite_difference": {
+            "step_A": step,
+            "stencil": "five-point central negative derivative",
+            "quantity": "negative coordinate derivative of the fixed-seed feature scalar; not a physical energy force",
+            "rtol": 1e-7,
+            "atol": 1e-9,
+            "coordinates": coordinate_probes,
+        },
         "comparisons": comparisons,
     }
     encoded = json.dumps(report, sort_keys=True)

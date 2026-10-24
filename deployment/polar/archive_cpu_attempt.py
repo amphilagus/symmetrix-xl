@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Archive this deployment's failed cpu-omp attempt before a clean retry.
+
+Default is a read-only plan. --apply checks Slurm and /proc on every cluster
+compute node before moving only the enumerated cpu-omp paths. Logs and science
+locks remain in place; their hashes and all moves are recorded in the archive.
+Use a control interpreter outside the cpu-omp environment being archived.
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+
+from bootstrap import sha256, write_json
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def plan(root, toolchain_job):
+    manifest = json.loads((root / "manifests/cpu-toolchain.json").read_text())
+    require(
+        manifest["profile"] == "cpu-omp" and manifest["slurm_job_id"] == toolchain_job,
+        "Toolchain attempt does not match the explicitly requested archive",
+    )
+    build = root / "build/cpu-toolchain" / toolchain_job
+    require(
+        Path(manifest["build_root"]).resolve() == build,
+        "Toolchain manifest build path escaped its task scope",
+    )
+    relative = [
+        "opt/openblas-omp",
+        "opt/cpu-omp",
+        "opt/base/openmp",
+        "build/native/cpu-omp",
+        "build/wheels/cpu-omp",
+        "build/cache/cpu-omp",
+        "manifests/cpu-toolchain.json",
+        "manifests/runtime-cpu-omp.json",
+        "manifests/build/cpu-omp",
+        "benchmark/qualification/cpu-omp",
+        "benchmark/performance/cpu-omp",
+        str(build.relative_to(root)),
+    ]
+    paths = [root / value for value in relative if (root / value).exists()]
+    for path in paths:
+        require(
+            not path.is_symlink() and path.resolve().is_relative_to(root),
+            "Archive path must be owned by this deployment: " + str(path),
+        )
+    return paths
+
+
+def active_jobs(root):
+    user = pwd.getpwuid(os.getuid()).pw_name
+    identifiers = subprocess.check_output(
+        ["squeue", "-h", "-u", user, "-o", "%i"], text=True
+    ).split()
+    matches = []
+    for identifier in identifiers:
+        record = subprocess.check_output(
+            ["scontrol", "show", "job", "-o", identifier], text=True
+        )
+        if str(root) in record and (
+            "cpu-omp" in record
+            or any(
+                name in record
+                for name in ("cpu_toolchain.sbatch", "qualify_cpu.sbatch")
+            )
+        ):
+            matches.append({"job_id": identifier, "record": record.strip()})
+    require(
+        not matches,
+        "CPU attempt still has active/pending Slurm jobs: " + json.dumps(matches),
+    )
+    return identifiers
+
+
+def process_scan(paths):
+    # Compatible with compute nodes' system Python 2.7; no numerical imports.
+    code = """import errno,json,os,socket
+prefixes=PREFIXES
+hits=[]
+errors=[]
+for name in os.listdir('/proc'):
+ if not name.isdigit() or int(name)==os.getpid(): continue
+ base='/proc/'+name
+ try:
+  if os.stat(base).st_uid != os.getuid(): continue
+ except OSError: continue
+ values=[]
+ for leaf in ('cmdline','maps'):
+  try:
+   with open(base+'/'+leaf,'rb') as stream: values.append(stream.read().decode('utf-8','replace'))
+  except IOError as error:
+   if error.errno not in (errno.ENOENT,errno.ESRCH): errors.append([name,leaf,str(error)])
+ for leaf in ('cwd','exe'):
+  try: values.append(os.readlink(base+'/'+leaf))
+  except OSError as error:
+   if error.errno not in (errno.ENOENT,errno.ESRCH): errors.append([name,leaf,str(error)])
+ try:
+  for fd in os.listdir(base+'/fd'):
+   try: values.append(os.readlink(base+'/fd/'+fd))
+   except OSError: pass
+ except OSError as error:
+  if error.errno not in (errno.ENOENT,errno.ESRCH): errors.append([name,'fd',str(error)])
+ matched=[prefix for prefix in prefixes if any(prefix in value for value in values)]
+ if matched: hits.append({'pid':int(name),'paths':matched})
+print(json.dumps({'node':socket.gethostname(),'hits':hits,'unreadable_own_processes':errors}))
+""".replace("PREFIXES", repr([str(path) for path in paths]))
+    nodes = sorted(
+        set(
+            subprocess.check_output(
+                ["sinfo", "-N", "-h", "-o", "%N"], text=True
+            ).split()
+        )
+    )
+    require(bool(nodes), "Slurm returned no compute-node inventory")
+    require(
+        all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", node) for node in nodes),
+        "Slurm node inventory contains an unsupported name",
+    )
+
+    def scan(node):
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                node,
+                "/usr/bin/python",
+                "-",
+            ],
+            input=code,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        require(
+            result.returncode == 0,
+            "Cannot verify live users on node " + node + ": " + result.stderr,
+        )
+        return json.loads(result.stdout)
+
+    local = subprocess.run(
+        [sys.executable, "-"], input=code, capture_output=True, text=True, check=True
+    )
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        records = [json.loads(local.stdout), *executor.map(scan, nodes)]
+    require(
+        not any(row["hits"] or row["unreadable_own_processes"] for row in records),
+        "Live users or unverified processes prevent archive: " + json.dumps(records),
+    )
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--toolchain-job", required=True)
+    parser.add_argument("--build-job", required=True)
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    require(
+        args.toolchain_job.isdigit() and args.build_job.isdigit(),
+        "Use numeric attempt job IDs",
+    )
+    root = args.root.resolve(strict=True)
+    require(
+        root.name == "mace-symmetrix-xl-polar",
+        "This retry tool is restricted to this task's new deployment",
+    )
+    paths = plan(root, args.toolchain_job)
+    require(
+        not any(
+            Path(sys.executable).resolve().is_relative_to(path)
+            or Path.cwd().resolve().is_relative_to(path)
+            for path in paths
+        ),
+        "The control interpreter/cwd must be outside archived paths",
+    )
+    record = {
+        "status": "plan",
+        "root": str(root),
+        "toolchain_job": args.toolchain_job,
+        "failed_build_job": args.build_job,
+        "paths": [str(path) for path in paths],
+    }
+    if not args.apply:
+        print(json.dumps(record, indent=2))
+        return 0
+    record["other_active_jobs"] = active_jobs(root)
+    record["process_checks"] = process_scan(paths)
+    active_jobs(root)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = root / "archives" / ("cpu-omp-before-lapack-" + stamp)
+    require(not archive.exists(), "Archive destination already exists")
+    archive.mkdir(parents=True)
+    record.update(
+        status="archiving",
+        archive=str(archive),
+        script_sha256=sha256(__file__),
+        moves=[],
+    )
+    record["unchanged_scientific_locks"] = {
+        str(path): sha256(path)
+        for path in (
+            root / "deployment/assets.lock.json",
+            root / "deployment/requirements.lock.txt",
+        )
+    }
+    record["preserved_logs"] = {
+        str(path): sha256(path)
+        for identifier in (args.toolchain_job, args.build_job)
+        for path in sorted((root / "logs").glob("*" + identifier + "*"))
+        if path.is_file()
+    }
+    require(
+        any(args.build_job in name for name in record["preserved_logs"]),
+        "Failed build log was not found",
+    )
+    record_path = archive / "archive.json"
+    write_json(record_path, record)
+    try:
+        for path in paths:
+            target = archive / path.relative_to(root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(target)
+            record["moves"].append({"source": str(path), "archive": str(target)})
+            write_json(record_path, record)
+        require(
+            all(
+                sha256(path) == digest
+                for path, digest in record["unchanged_scientific_locks"].items()
+            ),
+            "Scientific dependency locks changed",
+        )
+        record["status"] = "archived"
+    except Exception as error:
+        record.update(status="archive_incomplete", error=repr(error))
+        raise
+    finally:
+        write_json(record_path, record)
+    print(json.dumps({"status": record["status"], "archive": str(archive)}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

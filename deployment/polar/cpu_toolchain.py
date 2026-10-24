@@ -16,6 +16,10 @@ from bootstrap import environment, library_paths, sha256, write_json
 
 OPENBLAS_SHA256 = "f1003466ad074e9b0c8d421a204121100b0751c96fc6fcf3d1456bd12f8a00a1"
 GOMP_SHA256 = "b16672394348cbc11df46cc6445a7ef4f3b3112de8ca48b8c548e3e43db6652e"
+FORTRAN_RUNTIME_SHA256 = {
+    "libgfortran.so.5": "7a27115b7aa238c109b65f185273919ce4e9d86ceaa8e30e1c3a8e8bb618a3e1",
+    "libquadmath.so.0": "ba9491cfb23a6d8bc2263849f76435072cbb7203658a1367cdd782d586c770d3",
+}
 
 
 def verified_copy(source, target, expected):
@@ -41,6 +45,15 @@ def build(root, donor, archive, jobs):
     if not 1 <= jobs <= allocated:
         raise ValueError(f"Requested {jobs} workers but Slurm allocated {allocated}")
     env = environment(root, donor)
+    for key in (
+        "NO_LAPACK",
+        "NO_LAPACKE",
+        "NOFORTRAN",
+        "ONLY_CBLAS",
+        "MAKEFLAGS",
+        "MFLAGS",
+    ):
+        env.pop(key, None)
     compilers = {}
     for name in ("CC", "CXX", "FC"):
         compiler = Path(env[name])
@@ -72,6 +85,33 @@ def build(root, donor, archive, jobs):
         if alias.exists() or alias.is_symlink():
             raise FileExistsError(f"Unexpected existing OpenMP alias: {alias}")
         alias.symlink_to(own_gomp.name)
+    fortran_runtime = {}
+    for name in ("libgfortran.so.5", "libquadmath.so.0", "libgcc_s.so.1"):
+        source = Path(
+            subprocess.check_output(
+                [env["FC"], "-print-file-name=" + name], env=env, text=True
+            ).strip()
+        ).resolve(strict=True)
+        if not source.is_relative_to(donor / "opt/gcc/12.4.0"):
+            raise RuntimeError(
+                f"Fortran dependency escaped the compiler toolchain: {source}"
+            )
+        expected = FORTRAN_RUNTIME_SHA256.get(name, sha256(source))
+        if sha256(source) != expected:
+            raise RuntimeError(f"Fixed compiler runtime digest mismatch: {source}")
+        owned = root / "opt/base/gcc-runtime/lib64" / name
+        mode = "reuse_verified_owned_runtime"
+        if not owned.is_file() or sha256(owned) != expected:
+            # Keep shared runtime files used by existing CPU/GPU jobs immutable.
+            owned = own_gomp.parent / name
+            verified_copy(source, owned, expected)
+            mode = "stage_cpu_only_runtime"
+        fortran_runtime[name] = {
+            "compiler_source": str(source),
+            "path": str(owned),
+            "sha256": expected,
+            "mode": mode,
+        }
     staged_archive = root / "src/dependency-archives/OpenBLAS-0.3.28.tar.gz"
     verified_copy(archive, staged_archive, OPENBLAS_SHA256)
     prefix = root / "opt/openblas-omp"
@@ -91,7 +131,6 @@ def build(root, donor, archive, jobs):
         "NUM_THREADS=64",
         "NO_AFFINITY=1",
         "NO_SHARED=0",
-        "NO_LAPACK=1",
         "NO_LAPACKE=1",
         "CFLAGS=-O2 -fPIC",
         "FFLAGS=-O2 -fPIC",
@@ -157,6 +196,43 @@ def build(root, donor, archive, jobs):
         env=probe_env,
         text=True,
     )
+    lapack_source = build_root / "probe_lapack.f90"
+    lapack_source.write_text(
+        "program probe_lapack\n"
+        "  implicit none\n"
+        "  complex :: a(2,2), work(10)\n"
+        "  real :: w(2), rwork(4)\n"
+        "  integer :: info\n"
+        "  a = (0.0,0.0)\n"
+        "  a(1,1) = (1.0,0.0)\n"
+        "  a(2,2) = (3.0,0.0)\n"
+        "  call cheev('N','U',2,a,2,w,work,10,rwork,info)\n"
+        "  if (info /= 0) stop 1\n"
+        "  if (abs(w(1)-1.0)>1.e-5 .or. abs(w(2)-3.0)>1.e-5) stop 2\n"
+        "  print *, 'cheev_ linked and executed; eigenvalues=', w\n"
+        "end program probe_lapack\n"
+    )
+    lapack_probe = build_root / "probe_lapack"
+    lapack_compile = [
+        env["FC"],
+        "-fopenmp",
+        str(lapack_source),
+        "-L" + str(prefix / "lib"),
+        "-lopenblas",
+        "-o",
+        str(lapack_probe),
+    ]
+    subprocess.run(lapack_compile, env=env, check=True)
+    lapack_result = subprocess.check_output(
+        [
+            str(loader),
+            "--library-path",
+            ":".join(library_paths(root, "cpu-omp")),
+            str(lapack_probe),
+        ],
+        env=probe_env,
+        text=True,
+    )
     files = {
         str(p.relative_to(prefix)): sha256(p)
         for p in sorted(prefix.rglob("*"))
@@ -184,8 +260,13 @@ def build(root, donor, archive, jobs):
                 "path": str(own_gomp),
                 "sha256": GOMP_SHA256,
             },
+            "fortran_runtime": fortran_runtime,
             "openblas": {
                 "prefix": str(prefix),
+                "lapack_enabled": True,
+                "lapack_configuration": "upstream default; inherited disabling flags removed",
+                "lapack_probe_compile": lapack_compile,
+                "lapack_probe": lapack_result,
                 "files": files,
                 "probe": probe_result,
                 "dependencies": dependency_list,

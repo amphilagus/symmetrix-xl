@@ -171,6 +171,10 @@ def install_cpu_openmp_loader(root, profile):
         or sha256(target) != manifest["openmp"]["sha256"]
     ):
         raise RuntimeError("Qualified CPU OpenMP toolchain is missing or changed")
+    if manifest["openblas"].get("lapack_enabled") is not True:
+        raise RuntimeError(
+            "CPU OpenBLAS must include the upstream-required LAPACK routines"
+        )
     blas = root / "opt/openblas-omp/lib/libopenblas.so"
     if (
         not blas.is_file()

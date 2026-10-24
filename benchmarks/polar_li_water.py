@@ -633,7 +633,7 @@ def prepare(args):
     from ase import units
     from ase.io import write
     from ase.md.langevin import Langevin
-    from ase.optimize import BFGS
+    from ase.optimize import BFGS, LBFGS
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -681,16 +681,25 @@ def prepare(args):
                 write(prefix.with_suffix(".initial.extxyz"), atoms)
             if args.stage in ("optimize", "all"):
                 atoms.calc = calculator
-                optimizer = BFGS(
+                selected_optimizer = (
+                    ("lbfgs" if waters >= 256 else "bfgs")
+                    if args.optimizer == "auto"
+                    else args.optimizer
+                )
+                optimizer_class = LBFGS if selected_optimizer == "lbfgs" else BFGS
+                optimizer = optimizer_class(
                     atoms,
-                    logfile=str(prefix.with_suffix(".bfgs.log")),
-                    trajectory=str(prefix.with_suffix(".bfgs.traj")),
+                    logfile=str(prefix.with_suffix(f".{selected_optimizer}.log")),
+                    trajectory=str(prefix.with_suffix(f".{selected_optimizer}.traj")),
                 )
                 converged = bool(
                     optimizer.run(fmax=args.fmax, steps=args.max_opt_steps)
                 )
                 fmax = float(np.linalg.norm(atoms.get_forces(), axis=1).max())
                 manifest["optimization"] = {
+                    "optimizer_requested": args.optimizer,
+                    "optimizer": selected_optimizer,
+                    "optimizer_class": f"{optimizer_class.__module__}.{optimizer_class.__name__}",
                     "converged": converged,
                     "steps": optimizer.nsteps,
                     "maximum_force_eV_A": fmax,
@@ -703,7 +712,7 @@ def prepare(args):
                 write(path, atoms)
                 if not converged:
                     raise RuntimeError(
-                        f"BFGS did not converge in {args.max_opt_steps} steps; fmax={fmax}"
+                        f"{selected_optimizer.upper()} did not converge in {args.max_opt_steps} steps; fmax={fmax}"
                     )
             if args.stage in ("equilibrate", "all"):
                 if args.input and not manifest.get("optimization"):
@@ -1316,6 +1325,12 @@ def parser():
     )
     preparation.add_argument("--density", type=float, default=1.0)
     preparation.add_argument("--max-opt-steps", type=int, default=2000)
+    preparation.add_argument(
+        "--optimizer",
+        choices=("auto", "bfgs", "lbfgs"),
+        default="auto",
+        help="auto uses LBFGS for >=256 waters, otherwise BFGS; cell and convergence tolerance are unchanged",
+    )
     preparation.add_argument("--fmax", type=float, default=0.05)
     preparation.add_argument("--nvt-steps", type=int, default=500)
     preparation.set_defaults(function=prepare)

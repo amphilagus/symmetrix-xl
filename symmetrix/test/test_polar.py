@@ -370,6 +370,55 @@ def test_multivalue_head_payload_is_not_collapsed(reduced_polar_model):
         }
 
 
+@pytest.mark.parametrize("left,right", [(0, 1), (0, 2), (0, 3), (1, 0), (2, 0), (3, 0)])
+def test_scalar_tensor_product_constants_match_analytic_fp64_path(left, right):
+    torch, _ = _polar_dependencies()
+    from e3nn import o3
+    from symmetrix.extract_mace_nonlinear import _tensor_product
+
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float32)
+        product = o3.ElementwiseTensorProduct(f"1x{left}e", f"1x{right}e").double()
+        exported = _tensor_product(product)["instructions"][0]["wigner_3j"]
+    finally:
+        torch.set_default_dtype(old_dtype)
+    expected = o3.wigner_3j(left, right, max(left, right), dtype=torch.float64)
+    actual = torch.tensor(exported["values"], dtype=torch.float64).reshape(
+        exported["shape"]
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_general_tensor_product_preserves_compiled_wigner_precision():
+    torch, _ = _polar_dependencies()
+    from e3nn import o3
+    from symmetrix.extract_mace_nonlinear import _tensor_product
+
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float32)
+        product = o3.TensorProduct(
+            "1x1o", "1x2e", "1x2o", [(0, 0, 0, "uuu", False)], _specialized_code=False
+        ).double()
+        retained = [
+            value
+            for name, value in product.named_buffers()
+            if name.endswith("_w3j_1_2_2")
+        ]
+        assert retained
+        original = retained[0].clone()
+        torch.set_default_dtype(torch.float64)
+        exported = _tensor_product(product)["instructions"][0]["wigner_3j"]
+    finally:
+        torch.set_default_dtype(old_dtype)
+    actual = torch.tensor(exported["values"], dtype=torch.float64).reshape(
+        exported["shape"]
+    )
+    torch.testing.assert_close(actual, original, rtol=0, atol=0)
+    torch.testing.assert_close(retained[0], original, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("bridge", ["host", "dlpack"])
 def test_complete_polar_energy_force_and_density_oracle(
     reduced_polar_model, lithium_water, bridge

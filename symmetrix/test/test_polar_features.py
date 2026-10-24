@@ -97,7 +97,11 @@ def _make_native_feature_case(model, atoms, tmp_path):
 
 @pytest.fixture
 def native_feature_case(reduced_polar_model, lithium_water, tmp_path):
-    return _make_native_feature_case(reduced_polar_model, lithium_water, tmp_path)
+    # Pytest retains the last item's fixture arguments through session teardown.
+    # Construct native owners inside each test so the Kokkos finalizer can run.
+    return lambda: _make_native_feature_case(
+        reduced_polar_model, lithium_water, tmp_path
+    )
 
 
 def _oracle_comparison(actual, reference, *, label, rtol, atol):
@@ -178,7 +182,7 @@ def test_real_h512_s_features_and_arbitrary_seed_vjp(
 
 
 def test_native_features_and_arbitrary_seed_vjp_match_upstream(native_feature_case):
-    native, inputs, expected, seeds, negative_gradient = native_feature_case
+    native, inputs, expected, seeds, negative_gradient = native_feature_case()
     token = native._forward_features(*inputs)
     actual = native._feature_arrays(token)
     assert len(actual) == len(expected)
@@ -197,7 +201,7 @@ def test_native_features_and_arbitrary_seed_vjp_match_upstream(native_feature_ca
 
 def test_dlpack_feature_snapshot_and_vjp_match_host_bridge(native_feature_case):
     torch, _ = _polar_dependencies()
-    native, inputs, expected, seeds, negative_gradient = native_feature_case
+    native, inputs, expected, seeds, negative_gradient = native_feature_case()
     token = native._forward_features(*inputs)
     snapshots = [
         torch.utils.dlpack.from_dlpack(capsule)
@@ -228,7 +232,7 @@ def test_dlpack_feature_snapshot_and_vjp_match_host_bridge(native_feature_case):
 
 @pytest.mark.parametrize("invalidate", ["forward", "reverse", "ordinary_compute"])
 def test_feature_tape_rejects_stale_tokens(native_feature_case, invalidate):
-    native, inputs, _, seeds, _ = native_feature_case
+    native, inputs, _, seeds, _ = native_feature_case()
     token = native._forward_features(*inputs)
     if invalidate == "forward":
         native._forward_features(*inputs)
@@ -247,7 +251,7 @@ def test_feature_tape_rejects_stale_tokens(native_feature_case, invalidate):
 
 
 def test_feature_seed_shape_is_validated_before_reverse(native_feature_case):
-    native, inputs, _, seeds, _ = native_feature_case
+    native, inputs, _, seeds, _ = native_feature_case()
     token = native._forward_features(*inputs)
     malformed = [np.zeros((1, 1), dtype=np.float64)]
     with pytest.raises(
@@ -259,7 +263,7 @@ def test_feature_seed_shape_is_validated_before_reverse(native_feature_case):
 
 
 def test_feature_tape_owns_inputs_after_forward_returns(native_feature_case):
-    native, inputs, _, seeds, negative_gradient = native_feature_case
+    native, inputs, _, seeds, negative_gradient = native_feature_case()
     token = native._forward_features(*inputs)
     # These host arrays can be reused by a neighbor builder before backward.
     # A tape that only retained borrowed NumPy views would now use wrong data.

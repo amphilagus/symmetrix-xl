@@ -113,17 +113,33 @@ def _tensor_product(module) -> dict[str, Any]:
         "weight": _tensor(module.weight),
         "output_mask": _tensor(module.output_mask),
     }
-    # e3nn does not retain its generated Wigner tensors as module buffers.  Store
-    # them explicitly so evaluating this schema never imports e3nn at runtime.
+    # General e3nn paths retain their actual generated Wigner constants in
+    # compiled-module buffers. Scalar specializations instead divide by a
+    # Python sqrt(dim), so regenerating in the global FP32 default and only
+    # then upcasting would introduce a different constant into an FP64 graph.
+    buffers = dict(module.named_buffers())
     for instruction in output["instructions"]:
         in1 = module.irreps_in1[instruction["i_in1"]].ir.l
         in2 = module.irreps_in2[instruction["i_in2"]].ir.l
         out = module.irreps_out[instruction["i_out"]].ir.l
+        suffix = f"_w3j_{in1}_{in2}_{out}"
+        retained = [
+            value
+            for name, value in buffers.items()
+            if name.rsplit(".", 1)[-1] == suffix
+        ]
+        if retained:
+            wigner = retained[0]
+            if any(not torch.equal(wigner, value) for value in retained[1:]):
+                raise RuntimeError(
+                    f"Compiled tensor-product constants disagree for {suffix}."
+                )
+        elif in1 == 0 or in2 == 0:
+            wigner = o3.wigner_3j(in1, in2, out, dtype=torch.float64)
+        else:
+            wigner = o3.wigner_3j(in1, in2, out)
         instruction["wigner_3j"] = _tensor(
-            o3.wigner_3j(in1, in2, out).to(
-                dtype=module.weight.dtype,
-                device=module.weight.device,
-            )
+            wigner.to(dtype=module.weight.dtype, device=module.weight.device)
         )
     return output
 

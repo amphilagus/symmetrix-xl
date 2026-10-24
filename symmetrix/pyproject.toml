@@ -76,6 +76,11 @@ mace = [
     "torch>=2.5",
     "mace-torch",
 ]
+polar = [
+    "torch>=2.5",
+    "mace-torch==0.3.16",
+    "graph-longrange==0.4.4",
+]
 dispersion = [
     "torch-dftd",
 ]

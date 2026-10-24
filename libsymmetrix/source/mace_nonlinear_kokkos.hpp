@@ -347,7 +347,29 @@ public:
     void compute_Y(
         Kokkos::View<const double*> xyz,bool evaluator_stream=false);
 
+    using FeatureView=Kokkos::View<Precision**,Kokkos::LayoutRight>;
+    using ConstFeatureView=Kokkos::View<const Precision**,Kokkos::LayoutRight>;
+    // The feature boundary uses the model's post-product representations. It
+    // deliberately excludes readouts, energy scaling, and pair repulsion.
+    std::uint64_t forward_features(
+        int num_nodes,Kokkos::View<const int*> node_types,
+        Kokkos::View<const int*> num_neigh,Kokkos::View<const int*> neigh_indices,
+        Kokkos::View<const int*> neigh_types,Kokkos::View<const double*> xyz,
+        Kokkos::View<const double*> distances);
+    std::vector<ConstFeatureView> feature_views(std::uint64_t token) const;
+    void reverse_features(
+        std::uint64_t token,const std::vector<ConstFeatureView>& adjoints);
+
 private:
+    enum class FeatureMode { inactive, forward, reverse };
+    FeatureMode feature_mode=FeatureMode::inactive;
+    std::uint64_t next_feature_token=0,active_feature_token=0;
+    int feature_num_nodes=0;
+    Kokkos::View<const int*> feature_node_types,feature_num_neigh,
+        feature_neigh_indices,feature_neigh_types;
+    Kokkos::View<const double*> feature_xyz,feature_distances;
+    std::vector<FeatureView> feature_external_adjoints;
+    void validate_feature_token(std::uint64_t token) const;
     struct SphericalHarmonicsState;
     explicit MaceNonlinearKokkosT(const nlohmann::json& data);
 

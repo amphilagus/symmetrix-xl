@@ -15,6 +15,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import tarfile
 import zipfile
 
 
@@ -166,14 +167,20 @@ def prepare(root, donor, profile):
         archive = source / "downloads" / asset["filename"]
         if sha256(archive) != asset["sha256"]:
             raise ValueError("Application source archive hash mismatch")
-        subprocess.run([python, "-m", "pip", "install", "--no-index", "--no-deps", "--no-build-isolation", str(source / asset["directory"])], check=True, env=env)
+        unpacked = root / "src/dependency-sources" / profile
+        unpacked.mkdir(parents=True, exist_ok=True)
+        tree = unpacked / asset["directory"]
+        if not tree.exists():
+            with tarfile.open(archive) as bundle:
+                bundle.extractall(unpacked, filter="data")
+        subprocess.run([python, "-m", "pip", "install", "--no-index", "--no-deps", "--no-build-isolation", str(tree)], check=True, env=env)
     # Reproduce the two already-qualified, API-only MACE/graph compatibility fixes.
     patched = donor / "opt/polar" / RUNTIME_ID / "venv/lib/python3.12/site-packages/mace/modules/extensions.py"
     destination = site / "mace/modules/extensions.py"
     before = sha256(destination)
     shutil.copy2(patched, destination)
     subprocess.run([python, "-m", "pip", "install", "--no-index", *links,
-                    "scikit-build-core", "pybind11", "ninja", "pytest", "ruff", "pre-commit"], check=True, env=env)
+                    "scikit-build-core", "pybind11", "ninja", "pytest", "ruff"], check=True, env=env)
     install_wrappers(root, profile)
     subprocess.run([python, "-m", "pip", "check"], check=True, env=env)
     write_json(root / "manifests" / ("runtime-" + profile + ".json"), {

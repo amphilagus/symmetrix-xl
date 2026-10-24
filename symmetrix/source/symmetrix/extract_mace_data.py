@@ -308,6 +308,11 @@ def _extract_single_head_data(
     device = torch.device("cpu")
     if not isinstance(model, torch.nn.Module):
         model = _load_mace_checkpoint(model, device)
+    if any(cls.__name__ == "PolarMACE" for cls in type(model).__mro__):
+        raise ValueError(
+            "PolarMACE contains additional charge, field, and electrostatic energy "
+            "terms. Use SymmetrixPolar; ordinary MACE extraction would discard them."
+        )
     model = model.to(device=device, dtype=torch.float64)
     model.eval()
 

@@ -2161,6 +2161,7 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_scratch_budget_bytes(
 template<typename Precision>
 void MaceNonlinearKokkosT<Precision>::invalidate_factorized_prepared_graph()
 {
+    active_feature_token=0;
     factorized_prepared_graph_generation=0;
     factorized_prepared_geometry_graph_generation=0;
     factorized_prepared_batch_graph_generation=0;
@@ -3611,8 +3612,109 @@ void MaceNonlinearKokkosT<Precision>::compute_Y(
 }
 
 template<typename Precision>
+void MaceNonlinearKokkosT<Precision>::validate_feature_token(
+    const std::uint64_t token) const
+{
+    if(token==0||token!=active_feature_token)
+        throw std::invalid_argument(
+            "Feature tape token is stale or has already been consumed.");
+    if(streamed_edges!=MACEStreamedEdgesMode::materialized)
+        throw std::invalid_argument(
+            "Feature VJP currently requires materialized nonlinear execution.");
+}
+
+template<typename Precision>
+std::uint64_t MaceNonlinearKokkosT<Precision>::forward_features(
+    int num_nodes,Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,Kokkos::View<const int*> neigh_indices,
+    Kokkos::View<const int*> neigh_types,Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> distances)
+{
+    active_feature_token=0;
+    if constexpr(!std::is_same_v<Precision,double>)
+        throw std::invalid_argument("Feature VJP currently requires float64.");
+    if(streamed_edges!=MACEStreamedEdgesMode::materialized)
+        throw std::invalid_argument(
+            "Feature VJP currently requires materialized nonlinear execution.");
+    feature_num_nodes=num_nodes;
+    // Python's CPU inputs can alias unmanaged NumPy storage. The tape must
+    // remain valid even if the caller releases or mutates those arrays.
+    const auto snapshot=[](const auto& source) {
+        using Value=typename std::decay_t<decltype(source)>::non_const_value_type;
+        Kokkos::View<Value*> owned("feature tape input",source.extent(0));
+        Kokkos::deep_copy(owned,source);
+        return Kokkos::View<const Value*>(owned);
+    };
+    feature_node_types=snapshot(node_types);
+    feature_num_neigh=snapshot(num_neigh);
+    feature_neigh_indices=snapshot(neigh_indices);
+    feature_neigh_types=snapshot(neigh_types);
+    feature_xyz=snapshot(xyz);
+    feature_distances=snapshot(distances);
+    feature_mode=FeatureMode::forward;
+    try {
+        compute_node_energies_forces(num_nodes,feature_node_types,feature_num_neigh,
+            feature_neigh_indices,feature_neigh_types,feature_xyz,feature_distances);
+        feature_mode=FeatureMode::inactive;
+    } catch(...) {
+        feature_mode=FeatureMode::inactive;
+        throw;
+    }
+    if(++next_feature_token==0)++next_feature_token;
+    active_feature_token=next_feature_token;
+    return active_feature_token;
+}
+
+template<typename Precision>
+std::vector<typename MaceNonlinearKokkosT<Precision>::ConstFeatureView>
+MaceNonlinearKokkosT<Precision>::feature_views(const std::uint64_t token) const
+{
+    validate_feature_token(token);
+    auto result=std::vector<ConstFeatureView>();
+    result.reserve(states.size());
+    for(const auto& state:states)result.emplace_back(state.output);
+    return result;
+}
+
+template<typename Precision>
+void MaceNonlinearKokkosT<Precision>::reverse_features(
+    const std::uint64_t token,const std::vector<ConstFeatureView>& adjoints)
+{
+    validate_feature_token(token);
+    if(adjoints.size()!=states.size())
+        throw std::invalid_argument("Feature VJP requires one adjoint per layer.");
+    for(std::size_t layer=0;layer<states.size();++layer)
+        if(adjoints[layer].extent(0)!=states[layer].output.extent(0)
+            ||adjoints[layer].extent(1)!=states[layer].output.extent(1))
+            throw std::invalid_argument("Feature VJP adjoint shape is inconsistent.");
+    feature_external_adjoints.clear();
+    for(const auto& adjoint:adjoints) {
+        FeatureView owned("feature external adjoint",
+            adjoint.extent(0),adjoint.extent(1));
+        Kokkos::deep_copy(owned,adjoint);
+        feature_external_adjoints.emplace_back(std::move(owned));
+    }
+    active_feature_token=0;
+    feature_mode=FeatureMode::reverse;
+    try {
+        compute_node_energies_forces(feature_num_nodes,feature_node_types,
+            feature_num_neigh,feature_neigh_indices,feature_neigh_types,
+            feature_xyz,feature_distances);
+        Kokkos::fence("Complete nonlinear feature VJP");
+        feature_mode=FeatureMode::inactive;
+        feature_external_adjoints.clear();
+    } catch(...) {
+        feature_mode=FeatureMode::inactive;
+        feature_external_adjoints.clear();
+        throw;
+    }
+}
+
+template<typename Precision>
 void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes,Kokkos::View<const int*> node_types,Kokkos::View<const int*> num_neigh,Kokkos::View<const int*> neigh_indices,Kokkos::View<const int*> neigh_types,Kokkos::View<const double*> xyz,Kokkos::View<const double*> distances,const std::uint64_t execution_graph_generation)
 {
+    const bool external_feature_vjp=feature_mode==FeatureMode::reverse;
+    if(feature_mode==FeatureMode::inactive)active_feature_token=0;
     const bool use_pair_spline=mh1_edge_executor_=="pair_spline_v1";
     if(!use_pair_spline&&mace_uses_direct_execution(streamed_edges)
         &&!jit_mh1_host_plugin_ready()&&!jit_mh1_host_plugin_v4_ready()
@@ -4078,7 +4180,10 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         }
     };
 
-    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
+    // Re-entering the geometric prelude above rebuilds the backward launch
+    // context; the saved interaction/product tape is retained and not replayed.
+    for(int layer=0;!external_feature_vjp
+        &&layer<static_cast<int>(interactions.size());++layer) {
         auto& interaction=interactions[layer];
         auto& state=states[layer];
         const auto stage=symmetrix::mh1::layer_from_index(layer);
@@ -5222,7 +5327,19 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         features=state.output;
     }
 
-    for(int layer=0;!generated_node_program
+    if(feature_mode==FeatureMode::forward) {
+        Kokkos::fence("Complete nonlinear feature forward");
+        return;
+    }
+    if(external_feature_vjp)
+        for(std::size_t layer=0;layer<states.size();++layer) {
+            auto& state=states[layer];
+            ensure_view(state.layer_adjoint,state.layer_adjoint_storage,
+                num_nodes,products[layer].output_dimension());
+            Kokkos::deep_copy(state.layer_adjoint,
+                feature_external_adjoints[layer]);
+        }
+    for(int layer=0;!external_feature_vjp&&!generated_node_program
         &&layer<static_cast<int>(readouts.size());++layer) {
         auto& state=states[layer];
         readouts[layer].evaluate(state.output,readout_contribution);
@@ -5245,9 +5362,11 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
     auto energies=node_energies;
     auto e0=atomic_energies;
     const Precision energy_scale=scale,energy_shift=shift;
-    Kokkos::parallel_for("scale nonlinear energies",num_nodes,KOKKOS_LAMBDA(int node) {
-        energies(node)=e0(node_types(node))+energy_scale*energies(node)+energy_shift;
-    });
+    if(!external_feature_vjp) {
+        Kokkos::parallel_for("scale nonlinear energies",num_nodes,KOKKOS_LAMBDA(int node) {
+            energies(node)=e0(node_types(node))+energy_scale*energies(node)+energy_shift;
+        });
+    }
 
     ensure_view(harmonic_adjoints,harmonic_adjoints_storage,edges,num_lm);
     ordered_kokkos_deep_copy(harmonic_adjoints,Precision(0));
@@ -6868,7 +6987,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         }
     });
 
-    if(has_zbl) {
+    if(has_zbl&&!external_feature_vjp) {
         ensure_view(zbl_energies,zbl_energies_storage,num_nodes);
         ensure_view(zbl_forces,zbl_forces_storage,xyz.size());
         ordered_kokkos_deep_copy(zbl_energies,Precision(0));

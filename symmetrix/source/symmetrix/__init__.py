@@ -14,6 +14,7 @@ __version__ = "0.1.1"
 
 _FRONTEND_EXPORTS = {
     "Symmetrix": (".calculator", "Symmetrix"),
+    "SymmetrixPolar": (".polar", "SymmetrixPolar"),
     "FieldAwareCalculator": (".calculator", "FieldAwareCalculator"),
     "FieldContributionCalculator": (".calculator", "FieldContributionCalculator"),
     "SymmetrixEnsemble": (".ensemble", "SymmetrixEnsemble"),
@@ -109,6 +110,7 @@ __all__ = [
     "FieldAwareCalculator",
     "FieldContributionCalculator",
     "Symmetrix",
+    "SymmetrixPolar",
     "SymmetrixEnsemble",
     "available_backends",
     "load_backend",

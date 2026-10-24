@@ -2,6 +2,17 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <memory>
+
+#ifdef KOKKOS_ENABLE_CUDA
+#include <cuda_runtime_api.h>
+#elif defined(KOKKOS_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+#endif
+
 #include "device_environment.hpp"
 
 #include "mace_nonlinear_kokkos.hpp"
@@ -11,6 +22,143 @@ namespace py=pybind11;
 using IntArray=py::array_t<int,py::array::c_style|py::array::forcecast>;
 using Int64Array=py::array_t<std::int64_t,py::array::c_style|py::array::forcecast>;
 using DoubleArray=py::array_t<double,py::array::c_style|py::array::forcecast>;
+
+namespace {
+// DLPack's stable legacy ABI. Keeping these declarations local avoids a
+// dependency on either LibTorch or an optional Python DLPack header package.
+struct FeatureDLDevice { std::int32_t type,id; };
+struct FeatureDLDataType { std::uint8_t code,bits; std::uint16_t lanes; };
+struct FeatureDLTensor {
+    void* data;
+    FeatureDLDevice device;
+    std::int32_t ndim;
+    FeatureDLDataType dtype;
+    std::int64_t* shape;
+    std::int64_t* strides;
+    std::uint64_t byte_offset;
+};
+struct FeatureDLManagedTensor {
+    FeatureDLTensor tensor;
+    void* manager_ctx;
+    void (*deleter)(FeatureDLManagedTensor*);
+};
+
+FeatureDLDevice feature_dl_device()
+{
+#ifdef KOKKOS_ENABLE_CUDA
+    if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
+        int ordinal=0;
+        if(cudaGetDevice(&ordinal)!=cudaSuccess)
+            throw std::runtime_error("Could not query the feature CUDA device.");
+        return {2,ordinal};
+    }
+#elif defined(KOKKOS_ENABLE_HIP)
+    if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
+        int ordinal=0;
+        if(hipGetDevice(&ordinal)!=hipSuccess)
+            throw std::runtime_error("Could not query the feature HIP device.");
+        return {10,ordinal};
+    }
+#endif
+    return {1,0};
+}
+
+void synchronize_feature_producer()
+{
+    // Legacy DLPack capsules do not carry a producer stream. Synchronizing
+    // before the device copy establishes ownership without host staging.
+#ifdef KOKKOS_ENABLE_CUDA
+    if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
+        if(cudaDeviceSynchronize()!=cudaSuccess)
+            throw std::runtime_error("Could not synchronize feature CUDA seeds.");
+#elif defined(KOKKOS_ENABLE_HIP)
+    if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
+        if(hipDeviceSynchronize()!=hipSuccess)
+            throw std::runtime_error("Could not synchronize feature HIP seeds.");
+#endif
+}
+
+template<typename Precision>
+struct ExportedFeatureTensor {
+    KokkosLiveObjectGuard live_guard;
+    Kokkos::View<Precision**,Kokkos::LayoutRight> values;
+    std::array<std::int64_t,2> shape,strides;
+    FeatureDLManagedTensor managed{};
+};
+
+template<typename View>
+py::capsule export_feature_tensor(const View& source)
+{
+    using Precision=typename View::non_const_value_type;
+    using Owner=ExportedFeatureTensor<Precision>;
+    auto owner=std::make_unique<Owner>();
+    owner->values=decltype(owner->values)(
+        "exported nonlinear feature",source.extent(0),source.extent(1));
+    Kokkos::deep_copy(owner->values,source);
+    Kokkos::fence("Export nonlinear DLPack snapshot");
+    owner->shape={static_cast<std::int64_t>(source.extent(0)),
+        static_cast<std::int64_t>(source.extent(1))};
+    owner->strides={static_cast<std::int64_t>(owner->values.stride(0)),1};
+    owner->managed.tensor={owner->values.data(),feature_dl_device(),2,
+        {2,static_cast<std::uint8_t>(8*sizeof(Precision)),1},
+        owner->shape.data(),owner->strides.data(),0};
+    owner->managed.manager_ctx=owner.get();
+    owner->managed.deleter=[](FeatureDLManagedTensor* managed) {
+        delete static_cast<Owner*>(managed->manager_ctx);
+    };
+    auto* managed=&owner->managed;
+    py::capsule capsule(managed,"dltensor",[](PyObject* object) {
+        if(PyCapsule_IsValid(object,"dltensor")) {
+            auto* value=static_cast<FeatureDLManagedTensor*>(
+                PyCapsule_GetPointer(object,"dltensor"));
+            if(value&&value->deleter)value->deleter(value);
+        }
+    });
+    owner.release();
+    return capsule;
+}
+
+template<typename Precision>
+Kokkos::View<Precision**,Kokkos::LayoutRight> import_feature_tensor(
+    const py::handle capsule)
+{
+    if(!PyCapsule_IsValid(capsule.ptr(),"dltensor"))
+        throw py::value_error("Feature seeds require unused DLPack capsules.");
+    auto* managed=static_cast<FeatureDLManagedTensor*>(
+        PyCapsule_GetPointer(capsule.ptr(),"dltensor"));
+    const auto& tensor=managed->tensor;
+    const auto device=feature_dl_device();
+    if(tensor.device.type!=device.type||tensor.device.id!=device.id)
+        throw py::value_error("Feature seed and native evaluator devices differ.");
+    if(tensor.ndim!=2||!tensor.shape||tensor.dtype.code!=2
+        ||tensor.dtype.bits!=8*sizeof(Precision)||tensor.dtype.lanes!=1)
+        throw py::value_error("Feature seeds require rank-two native-precision floats.");
+    for(int axis=0;axis<2;++axis)
+        if(tensor.shape[axis]<0
+            ||tensor.shape[axis]>std::numeric_limits<int>::max())
+            throw py::value_error("Feature seed extent is out of range.");
+    if(tensor.strides&&(tensor.strides[1]!=1
+        ||tensor.strides[0]!=tensor.shape[1]))
+        throw py::value_error("Feature seeds must be contiguous.");
+    if(tensor.byte_offset%alignof(Precision)!=0
+        ||(!tensor.data&&tensor.shape[0]!=0&&tensor.shape[1]!=0))
+        throw py::value_error("Feature seed storage is invalid.");
+    using Unmanaged=Kokkos::View<const Precision**,Kokkos::LayoutRight,
+        typename Kokkos::DefaultExecutionSpace::memory_space,
+        Kokkos::MemoryUnmanaged>;
+    const auto* pointer=tensor.data?reinterpret_cast<const Precision*>(
+        static_cast<const unsigned char*>(tensor.data)+tensor.byte_offset):nullptr;
+    Unmanaged source(pointer,tensor.shape[0],tensor.shape[1]);
+    Kokkos::View<Precision**,Kokkos::LayoutRight> result(
+        "imported feature seed",tensor.shape[0],tensor.shape[1]);
+    Kokkos::deep_copy(result,source);
+    Kokkos::fence("Import nonlinear DLPack seed");
+    if(PyCapsule_SetName(capsule.ptr(),"used_dltensor")!=0)
+        throw py::error_already_set();
+    if(managed->deleter)managed->deleter(managed);
+    return result;
+}
+} // namespace
 
 template<typename Evaluator>
 void bind_mace_nonlinear_kokkos_evaluator(
@@ -452,6 +600,88 @@ void bind_mace_nonlinear_kokkos_evaluator(
                 return view2vector(self.stress_tensor);
             },
             py::arg("volumes"),py::arg("graph_generation"))
+        .def("_forward_features",
+            [](Evaluator& self,int num_nodes,IntArray node_types,
+                    IntArray num_neigh,IntArray neigh_indices,
+                    IntArray neigh_types,DoubleArray xyz,DoubleArray distances) {
+                return self.forward_features(num_nodes,
+                    create_kokkos_view("feature node types",node_types),
+                    create_kokkos_view("feature num neigh",num_neigh),
+                    create_kokkos_view("feature neigh indices",neigh_indices),
+                    create_kokkos_view("feature neigh types",neigh_types),
+                    create_kokkos_view("feature xyz",xyz),
+                    create_kokkos_view("feature distances",distances));
+            },py::arg("num_nodes"),py::arg("node_types"),py::arg("num_neigh"),
+            py::arg("neigh_indices"),py::arg("neigh_types"),py::arg("xyz"),
+            py::arg("distances"))
+        .def("_feature_arrays",[](Evaluator& self,std::uint64_t token) {
+            using Precision=typename Evaluator::precision_type;
+            py::list result;
+            for(const auto& view:self.feature_views(token)) {
+                const auto host=Kokkos::create_mirror_view_and_copy(
+                    Kokkos::HostSpace(),view);
+                py::array_t<Precision> array({
+                    static_cast<py::ssize_t>(host.extent(0)),
+                    static_cast<py::ssize_t>(host.extent(1))});
+                auto output=array.template mutable_unchecked<2>();
+                for(std::size_t i=0;i<host.extent(0);++i)
+                    for(std::size_t j=0;j<host.extent(1);++j)
+                        output(i,j)=host(i,j);
+                result.append(std::move(array));
+            }
+            return result;
+        },py::arg("token"))
+        .def("_feature_tensors",[](Evaluator& self,std::uint64_t token) {
+            py::list result;
+            for(const auto& view:self.feature_views(token))
+                result.append(export_feature_tensor(view));
+            return result;
+        },py::arg("token"))
+        .def("_reverse_features_host",
+            [](Evaluator& self,std::uint64_t token,py::sequence arrays) {
+                using Precision=typename Evaluator::precision_type;
+                using Array=py::array_t<Precision,
+                    py::array::c_style|py::array::forcecast>;
+                auto owned=std::vector<typename Evaluator::FeatureView>();
+                auto adjoints=std::vector<typename Evaluator::ConstFeatureView>();
+                for(const auto& item:arrays) {
+                    auto array=Array::ensure(item);
+                    if(!array||array.ndim()!=2)
+                        throw py::value_error("Feature seeds require rank-two arrays.");
+                    Kokkos::View<const Precision**,Kokkos::LayoutRight,
+                        Kokkos::HostSpace,Kokkos::MemoryUnmanaged> host(
+                            array.data(),array.shape(0),array.shape(1));
+                    typename Evaluator::FeatureView value(
+                        "host feature seed",array.shape(0),array.shape(1));
+                    Kokkos::deep_copy(value,host);
+                    owned.emplace_back(std::move(value));
+                    adjoints.emplace_back(owned.back());
+                }
+                self.reverse_features(token,adjoints);
+            },py::arg("token"),py::arg("adjoints"))
+        .def("_reverse_features",
+            [](Evaluator& self,std::uint64_t token,py::sequence capsules) {
+                using Precision=typename Evaluator::precision_type;
+                // Check the token before consuming any one-shot capsules.
+                self.feature_views(token);
+                synchronize_feature_producer();
+                auto owned=std::vector<typename Evaluator::FeatureView>();
+                auto adjoints=std::vector<typename Evaluator::ConstFeatureView>();
+                for(const auto& capsule:capsules) {
+                    owned.emplace_back(import_feature_tensor<Precision>(capsule));
+                    adjoints.emplace_back(owned.back());
+                }
+                self.reverse_features(token,adjoints);
+            },py::arg("token"),py::arg("adjoints"))
+        .def("_edge_force_tensor",[](Evaluator& self) {
+            if(self.node_forces.size()%3!=0)
+                throw py::value_error("Native edge force extent is inconsistent.");
+            using View=Kokkos::View<const double**,Kokkos::LayoutRight,
+                typename Kokkos::DefaultExecutionSpace::memory_space,
+                Kokkos::MemoryUnmanaged>;
+            return export_feature_tensor(View(self.node_forces.data(),
+                self.node_forces.size()/3,3));
+        })
         .def("compute_node_energies_forces",
             [](Evaluator& self,int num_nodes,IntArray node_types,
                     IntArray num_neigh,IntArray neigh_indices,

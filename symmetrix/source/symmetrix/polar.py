@@ -15,6 +15,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+from time import perf_counter
 
 import numpy as np
 from ase.calculators.calculator import Calculator, PropertyNotImplementedError
@@ -248,7 +249,9 @@ class SymmetrixPolar(Calculator):
     multi-GPU inference are intentionally rejected.
 
     ``bridge='host'`` copies features through host memory for debugging;
-    ``'dlpack'`` keeps feature values, adjoints and force reduction on device.
+    ``'dlpack'`` uses device snapshots and device-to-device adjoint copies;
+    it is not a zero-copy bridge. ``profile=True`` measures synchronized stage
+    times for a diagnostic call. Keep profiling disabled for throughput runs.
     """
 
     implemented_properties = [
@@ -260,7 +263,7 @@ class SymmetrixPolar(Calculator):
     def __init__(
         self, model, *, device="cpu", backend=None, bridge="host",
         precision="float64", charge=None, spin=None, head=None,
-        diagnostics=True, **kwargs,
+        diagnostics=True, profile=False, **kwargs,
     ):
         super().__init__(**kwargs)
         if precision != "float64":
@@ -279,6 +282,7 @@ class SymmetrixPolar(Calculator):
         self.default_charge = 0.0 if charge is None else float(charge)
         self.default_spin = 1.0 if spin is None else float(spin)
         self.diagnostics_enabled = bool(diagnostics)
+        self.profile = bool(profile)
         self._last_polar_state = None
         if isinstance(model, torch.nn.Module):
             self.checkpoint_sha256 = None
@@ -337,13 +341,33 @@ class SymmetrixPolar(Calculator):
             changes.append("polar_state")
         return changes
 
+    def _profile_stamp(self):
+        self.evaluator.fence()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return perf_counter()
+
     @torch.enable_grad()
     def calculate(self, atoms=None, properties=None, system_changes=None):
+        timings = {}
+        started = self._profile_stamp() if self.profile else 0.0
+        boundary = started
+
+        def mark(stage):
+            nonlocal boundary
+            if self.profile:
+                now = self._profile_stamp()
+                timings[stage] = (now - boundary) * 1000
+                boundary = now
+
         properties = ["energy", "forces"] if properties is None else properties
         unsupported = set(properties) - set(self.implemented_properties)
         if unsupported:
             raise PropertyNotImplementedError(f"Unsupported Polar properties: {sorted(unsupported)}")
         super().calculate(atoms, properties, system_changes)
+        # A failed recalculation must not leave values from a previous geometry
+        # beside ASE's newly copied atoms and make them look cached and valid.
+        self.results = {}
         atoms = self.atoms
         charge, spin = self._polar_state(atoms)
         if not len(atoms):
@@ -362,18 +386,6 @@ class SymmetrixPolar(Calculator):
         type_lookup = {number: index for index, number in enumerate(self.atomic_numbers)}
         node_types = np.asarray([type_lookup[int(n)] for n in atoms.numbers], dtype=np.int32)
         native_vectors = np.ascontiguousarray(vectors_np[:, [1, 2, 0]]).reshape(-1)
-        token = self.evaluator._forward_features(
-            len(atoms), node_types, np.bincount(receiver, minlength=len(atoms)).astype(np.int32),
-            sender.astype(np.int32), node_types[sender], native_vectors,
-            np.ascontiguousarray(lengths_np),
-        )
-        if self.bridge == "dlpack":
-            features = [torch.utils.dlpack.from_dlpack(value) for value in self.evaluator._feature_tensors(token)]
-            if any(value.device != self.device for value in features):
-                raise RuntimeError("Native and PyTorch Polar devices differ")
-        else:
-            features = [torch.tensor(value, device=self.device, dtype=torch.float64) for value in self.evaluator._feature_arrays(token)]
-        features = [value.detach().requires_grad_(True) for value in features]
         positions = torch.tensor(atoms.positions, device=self.device, dtype=torch.float64, requires_grad=True)
         cell = torch.tensor(atoms.cell.array, device=self.device, dtype=torch.float64)
         edge_index = torch.tensor(np.stack([sender, receiver]), device=self.device, dtype=torch.long)
@@ -382,19 +394,38 @@ class SymmetrixPolar(Calculator):
         node_attrs = torch.nn.functional.one_hot(
             torch.tensor(node_types, device=self.device, dtype=torch.long), len(self.atomic_numbers)
         ).to(torch.float64)
+        mark("graph")
+        token = self.evaluator._forward_features(
+            len(atoms), node_types, np.bincount(receiver, minlength=len(atoms)).astype(np.int32),
+            sender.astype(np.int32), node_types[sender], native_vectors,
+            np.ascontiguousarray(lengths_np),
+        )
+        mark("native_forward")
+        if self.bridge == "dlpack":
+            features = [torch.utils.dlpack.from_dlpack(value) for value in self.evaluator._feature_tensors(token)]
+            if any(value.device != self.device for value in features):
+                raise RuntimeError("Native and PyTorch Polar devices differ")
+        else:
+            features = [torch.tensor(value, device=self.device, dtype=torch.float64) for value in self.evaluator._feature_arrays(token)]
+        features = [value.detach().requires_grad_(True) for value in features]
+        mark("feature_export")
         with torch.enable_grad():
             output = _suffix(self.model, features, positions, cell, node_attrs, edge_index, vectors, charge, spin)
+            mark("torch_suffix_forward")
             gradients = torch.autograd.grad(output["energy"], [*features, positions], allow_unused=True)
         feature_gradients = [torch.zeros_like(value) if grad is None else grad.contiguous() for value, grad in zip(features, gradients[:-1])]
         direct_force = torch.zeros_like(positions) if gradients[-1] is None else -gradients[-1]
+        mark("torch_autograd")
         if self.bridge == "dlpack":
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             self.evaluator._reverse_features(token, [torch.utils.dlpack.to_dlpack(value) for value in feature_gradients])
+            mark("native_vjp")
             edge_force = torch.utils.dlpack.from_dlpack(self.evaluator._edge_force_tensor())
             edge_force = edge_force[:, [2, 0, 1]]
         else:
             self.evaluator._reverse_features_host(token, [value.detach().cpu().numpy() for value in feature_gradients])
+            mark("native_vjp")
             edge_force = torch.tensor(np.asarray(self.evaluator.node_forces).reshape(-1, 3)[:, [2, 0, 1]], device=self.device, dtype=torch.float64)
         forces = direct_force.clone()
         forces.index_add_(0, edge_index[1], edge_force)
@@ -414,6 +445,10 @@ class SymmetrixPolar(Calculator):
         self.results["polar_diagnostics"] = {
             "backbone": "native_feature_forward", "prefix_fallback": False,
             "bridge": self.bridge, "precision": "float64",
+            "bridge_semantics": (
+                "device_snapshot_and_d2d_seed_copy"
+                if self.bridge == "dlpack" else "host_snapshot_copy"
+            ),
             "feature_device": str(features[0].device),
             "native_class": type(self.evaluator).__module__ + "." + type(self.evaluator).__name__,
             "native_build_info": self.native_build_info,
@@ -436,3 +471,10 @@ class SymmetrixPolar(Calculator):
             self.results["polar_diagnostics"]["density_history"] = [value.detach().cpu().numpy().copy() for value in output["density_history"]]
             self.results["polar_diagnostics"]["fukui_history"] = [value.detach().cpu().numpy().copy() for value in output["fukui_history"]]
         self._last_polar_state = (charge, spin)
+        mark("force_result_assembly")
+        if self.profile:
+            timings["total"] = (boundary - started) * 1000
+            self.results["polar_diagnostics"]["timings_ms"] = timings
+            self.results["polar_diagnostics"]["timing_policy"] = (
+                "synchronized_diagnostic_call_excluded_from_throughput"
+            )

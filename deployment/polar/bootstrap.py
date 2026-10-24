@@ -93,7 +93,8 @@ def install_wrappers(root, profile):
     prefix = root / "opt" / profile
     loader = root / "opt/base/glibc-2.28/lib/ld-2.28.so"
     script = "#!/bin/bash\nset -euo pipefail\n"
-    script += "unset PYTHONHOME PYTHONPATH LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH\n"
+    script += "unset PYTHONHOME PYTHONPATH LD_PRELOAD LD_AUDIT\n"
+    script += 'if [ "${SYMMETRIX_POLAR_BUILD_MODE:-0}" != 1 ]; then unset LD_LIBRARY_PATH; fi\n'
     script += "export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 LC_ALL=C LANG=C\n"
     script += "export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1\n"
     script += "export NVIDIA_TF32_OVERRIDE=0 PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1\n"
@@ -160,7 +161,7 @@ def prepare(root, donor, profile):
     python = str(prefix / "bin/python")
     find_links = [source / "wheels", donor / "src/wheels_symmetrix", root / "src/wheels"]
     links = [part for path in find_links if path.exists() for part in ("--find-links", str(path))]
-    subprocess.run([python, "-m", "pip", "install", "--no-index", *links, "--require-hashes", "-r", str(root / "deployment/requirements.lock.txt")], env=env, check=True)
+    subprocess.run([python, "-m", "pip", "install", "--no-index", "--find-links", str(source / "wheels"), "--require-hashes", "-r", str(root / "deployment/requirements.lock.txt")], env=env, check=True)
     for asset in lock["sources"]:
         if asset["name"] == "glibc":
             continue

@@ -19,6 +19,7 @@ import pwd
 import re
 import subprocess
 import sys
+import time
 
 from bootstrap import sha256, write_json
 
@@ -87,9 +88,9 @@ def active_jobs(root):
     return identifiers
 
 
-def process_scan(paths):
+def process_probe_code(paths):
     # Compatible with compute nodes' system Python 2.7; no numerical imports.
-    code = """import errno,json,os,socket
+    return """import errno,json,os,socket
 prefixes=PREFIXES
 hits=[]
 errors=[]
@@ -117,8 +118,72 @@ for name in os.listdir('/proc'):
   if error.errno not in (errno.ENOENT,errno.ESRCH): errors.append([name,'fd',str(error)])
  matched=[prefix for prefix in prefixes if any(prefix in value for value in values)]
  if matched: hits.append({'pid':int(name),'paths':matched})
-print(json.dumps({'node':socket.gethostname(),'hits':hits,'unreadable_own_processes':errors}))
+print(json.dumps({'node':socket.gethostname().split('.')[0],'uid':os.getuid(),'hits':hits,'unreadable_own_processes':errors}))
 """.replace("PREFIXES", repr([str(path) for path in paths]))
+
+
+def read_proc_evidence(files, root, paths):
+    records = {}
+    expected_paths = sorted(str(path) for path in paths)
+    for filename in files:
+        filename = filename.resolve(strict=True)
+        require(
+            filename.is_relative_to(root / "manifests/archive-probes"),
+            "Process evidence must be in this deployment's archive-probes directory",
+        )
+        record = json.loads(filename.read_text())
+        require(
+            record.get("kind") == "POLAR_CPU_ARCHIVE_PROCESS_PROBE",
+            "Wrong process evidence kind",
+        )
+        require(
+            record["root"] == str(root) and sorted(record["paths"]) == expected_paths,
+            "Process evidence prefixes differ from this exact archive plan",
+        )
+        require(
+            record["uid"] == os.getuid()
+            and record["user"] == pwd.getpwuid(os.getuid()).pw_name,
+            "Process evidence belongs to another user",
+        )
+        age = time.time() - record["observed_unix"]
+        require(
+            -30 <= age <= 900
+            and abs(filename.stat().st_mtime - record["observed_unix"]) <= 60,
+            "Process evidence is stale or its timestamp is inconsistent",
+        )
+        require(
+            bool(record["slurm_job_id"])
+            and record["numerical_imports"] is False
+            and record["gpu_requested"] is False,
+            "Evidence must come from the metadata-only Slurm probe",
+        )
+        require(
+            record["probe_script_sha256"]
+            == sha256(Path(__file__).with_name("archive_cpu_probe.py"))
+            and record["scanner_script_sha256"] == sha256(__file__),
+            "Process evidence used another probe implementation",
+        )
+        node = record["node"]
+        require(
+            node == record["slurm_node"]
+            and node == record["processes"]["node"]
+            and record["processes"]["uid"] == os.getuid(),
+            "Process evidence node/user identity disagrees",
+        )
+        require(node not in records, "Duplicate process evidence for node " + node)
+        records[node] = {
+            **record["processes"],
+            "evidence_path": str(filename),
+            "evidence_sha256": sha256(filename),
+            "observed_unix": record["observed_unix"],
+            "slurm_job_id": record["slurm_job_id"],
+        }
+    return records
+
+
+def process_scan(paths, evidence_files=(), root=None):
+    code = process_probe_code(paths)
+    evidence = read_proc_evidence(evidence_files, root, paths) if evidence_files else {}
     nodes = sorted(
         set(
             subprocess.check_output(
@@ -131,8 +196,14 @@ print(json.dumps({'node':socket.gethostname(),'hits':hits,'unreadable_own_proces
         all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", node) for node in nodes),
         "Slurm node inventory contains an unsupported name",
     )
+    require(
+        set(evidence).issubset(nodes),
+        "Process evidence refers to a node outside the Slurm inventory",
+    )
 
     def scan(node):
+        if node in evidence:
+            return evidence[node]
         result = subprocess.run(
             [
                 "ssh",
@@ -151,7 +222,11 @@ print(json.dumps({'node':socket.gethostname(),'hits':hits,'unreadable_own_proces
         )
         require(
             result.returncode == 0,
-            "Cannot verify live users on node " + node + ": " + result.stderr,
+            "Cannot verify live users on node "
+            + node
+            + ": "
+            + result.stderr
+            + ". Submit archive_cpu_probe.sbatch on that node, then pass its fresh --proc-evidence JSON.",
         )
         return json.loads(result.stdout)
 
@@ -173,6 +248,7 @@ def main():
     parser.add_argument("--toolchain-job", required=True)
     parser.add_argument("--build-job", required=True)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--proc-evidence", type=Path, action="append", default=[])
     args = parser.parse_args()
     require(
         args.toolchain_job.isdigit() and args.build_job.isdigit(),
@@ -203,7 +279,7 @@ def main():
         print(json.dumps(record, indent=2))
         return 0
     record["other_active_jobs"] = active_jobs(root)
-    record["process_checks"] = process_scan(paths)
+    record["process_checks"] = process_scan(paths, args.proc_evidence, root)
     active_jobs(root)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     archive = root / "archives" / ("cpu-omp-before-lapack-" + stamp)

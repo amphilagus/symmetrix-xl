@@ -154,7 +154,7 @@ manifest records the actual optimizer class, and its log/trajectory suffix is
 and cell; changing optimizer does not imply a new thermodynamic state.
 
 The deployed `deployment/polar/experiment.sbatch` wrapper takes the deployment
-root, runtime profile (`cpu`, `sm80`, or `sm90`), then a driver subcommand. It
+root, runtime profile (`cpu`, `cpu-omp`, `sm80`, or `sm90`), then a driver subcommand. It
 selects the profile's interpreter and backend and supplies the local checkpoint,
 device, and bridge arguments. Submit model calculations through Slurm. CPU
 allocation defaults come from the wrapper; GPU submissions must request a GPU
@@ -295,3 +295,37 @@ allocation provides eight physical cores. The driver applies affinity before
 numerical imports, excludes SMT siblings, uses eight Kokkos/OpenMP threads and
 one BLAS thread, and verifies actual native concurrency. GPU calculations and
 all formal `benchmark`/`_worker` throughput runs require one CPU thread.
+
+For formal CPU deployment, run `cpu_toolchain.sbatch`, `prepare.sbatch` with
+profile `cpu-omp`, and `build.sbatch` with profile `cpu-omp` in that order, using
+Slurm `afterok` dependencies. The toolchain includes upstream's LAPACK routines
+and executes BLAS and LAPACK probes before accepting it. Then submit:
+
+```bash
+sbatch deployment/polar/qualify_cpu.sbatch "$DEPLOYMENT_ROOT"
+```
+
+This requires eight distinct physical cores. It checks the qualified binary and
+strict doctor, runs MD100 and MD1000 with eight cores, then validates all four
+sizes and times them on one core. CPU timing workers use two excluded warmup
+steps, three independent processes per executor, and blocks of at least ten
+seconds. Existing results are preserved and rejected as output destinations.
+
+`benchmarks/polar_module_profile.py` separately measures synchronized forward
+regions for local readouts, field descriptor geometry, four dynamic fields,
+the two density updates, local electron energy and Coulomb energy. It checks
+energy and force invariance when installing and removing instrumentation.
+The complete suffix autograd time is reported separately; long-range backward
+time is not independently isolated. These diagnostic calls are excluded from
+throughput and peak-memory measurements.
+
+```bash
+sbatch deployment/polar/profile_gpu_pair.sbatch "$DEPLOYMENT_ROOT"
+```
+
+On the configured cluster this creates module diagnostics and an Nsight Systems
+capture of one normal, uninstrumented call per GPU architecture. CUDA transfer
+and synchronization reports remain under `benchmark/module-profile/<job-id>`.
+The capture uses the same interpreter and loader paths directly to preserve
+Nsight injection, while keeping all caches inside the deployment. Run it after
+formal performance jobs have finished.

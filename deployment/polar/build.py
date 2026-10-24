@@ -178,6 +178,7 @@ def main():
             raise RuntimeError(label + " probe failed")
         if label == "version":
             report = json.loads(result.stdout)
+            write_json(manifest / "version.json", report)
             if report.get("probe_status") != "ok":
                 raise RuntimeError(
                     "Native probe unavailable: " + str(report.get("probe_error"))
@@ -223,6 +224,7 @@ def main():
             "-q",
             "symmetrix/test/test_polar.py",
             "symmetrix/test/test_polar_features.py",
+            "--junitxml=" + str(manifest / "polar-tests.xml"),
         ],
         cwd=source,
         env=env,
@@ -240,6 +242,16 @@ def main():
             ),
             "wheel_sha256": {p.name: sha256(p) for p in wheels.glob("*.whl")},
             "python_wrapper_sha256": sha256(python),
+            "version_probe_sha256": sha256(manifest / "version.json"),
+            "extension_path": str(probe["extension"]),
+            "extension_sha256": sha256(probe["extension"]),
+            "source_fingerprints": expected,
+            "submodules": subprocess.check_output(
+                ["git", "submodule", "status", "--recursive"],
+                cwd=source,
+                env=env,
+                text=True,
+            ).splitlines(),
             "shared_openblas_sha256": {
                 str(p): sha256(p)
                 for p in sorted(

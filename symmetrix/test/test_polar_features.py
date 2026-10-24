@@ -1,6 +1,9 @@
 """Independent feature and arbitrary-seed VJP oracles for the native bridge."""
 
+import hashlib
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -56,30 +59,28 @@ def _backbone_oracle(model, graph):
     return outputs, seeds, spherical_vectors, -gradient
 
 
-@pytest.fixture
-def native_feature_case(reduced_polar_model, lithium_water, tmp_path):
+def _make_native_feature_case(model, atoms, tmp_path):
+    """Construct the same independent prefix/VJP oracle for any real model."""
     import symmetrix
     from symmetrix.extract_mace_nonlinear import extract_mace_nonlinear_data
 
     # This internal serializer intentionally extracts only the native prefix;
     # the public converter must reject the same whole-model POLAR checkpoint.
     path = tmp_path / "polar-prefix.json"
-    path.write_text(json.dumps(extract_mace_nonlinear_data(reduced_polar_model)))
+    path.write_text(json.dumps(extract_mace_nonlinear_data(model)))
     _selected_device()
     native = symmetrix.load_backend().MACENonlinearKokkos(str(path))
-    graph = _batch(reduced_polar_model, lithium_water)
-    outputs, seeds, xyz, negative_gradient = _backbone_oracle(
-        reduced_polar_model, graph
-    )
+    graph = _batch(model, atoms)
+    outputs, seeds, xyz, negative_gradient = _backbone_oracle(model, graph)
     source, receiver = graph["edge_index"].cpu().numpy()
     order = np.argsort(receiver, kind="stable")
     node_types = graph["node_attrs"].argmax(dim=1).cpu().numpy().astype(np.int32)
     neighbors = source[order].astype(np.int32)
     vectors = xyz.detach().cpu().numpy()[order]
     inputs = (
-        len(lithium_water),
+        len(atoms),
         node_types,
-        np.bincount(receiver, minlength=len(lithium_water)).astype(np.int32),
+        np.bincount(receiver, minlength=len(atoms)).astype(np.int32),
         neighbors,
         node_types[neighbors],
         np.ascontiguousarray(vectors.reshape(-1)),
@@ -92,6 +93,88 @@ def native_feature_case(reduced_polar_model, lithium_water, tmp_path):
         seeds,
         negative_gradient.detach().cpu().numpy()[order],
     )
+
+
+@pytest.fixture
+def native_feature_case(reduced_polar_model, lithium_water, tmp_path):
+    return _make_native_feature_case(reduced_polar_model, lithium_water, tmp_path)
+
+
+def _oracle_comparison(actual, reference, *, label, rtol, atol):
+    actual, reference = np.asarray(actual), np.asarray(reference)
+    assert actual.shape == reference.shape
+    assert np.isfinite(actual).all() and np.isfinite(reference).all()
+    difference = np.abs(actual - reference)
+    normalized = difference / (atol + rtol * np.abs(reference))
+    worst = np.unravel_index(int(normalized.argmax()), normalized.shape)
+    return {
+        "label": label,
+        "shape": list(reference.shape),
+        "rtol": rtol,
+        "atol": atol,
+        "max_abs": float(difference.max()),
+        "max_normalized_ratio": float(normalized.max()),
+        "worst_index": [int(index) for index in worst],
+        "actual_at_worst": float(actual[worst]),
+        "reference_at_worst": float(reference[worst]),
+    }
+
+
+def test_real_h512_s_features_and_arbitrary_seed_vjp(
+    lithium_water, tmp_path, record_property
+):
+    """Opt-in real-checkpoint prefix isolation; no suffix or relaxed tolerance."""
+    checkpoint = os.environ.get("SYMMETRIX_POLAR_MODEL")
+    if not checkpoint:
+        pytest.skip("set SYMMETRIX_POLAR_MODEL to the MACE-POLAR-1-S checkpoint")
+    path = Path(checkpoint)
+    if not path.is_file():
+        pytest.fail(f"requested POLAR checkpoint does not exist: {path}")
+    torch, _ = _polar_dependencies()
+    from symmetrix._polar_compat import repair_polar_checkpoint
+
+    model = torch.load(path, map_location="cpu", weights_only=False).double().eval()
+    repair_polar_checkpoint(model, pbc_handling="pbc")
+    assert len(model.interactions) == 1
+    assert model.products[0].linear.irreps_out.dim == 512
+    native, inputs, expected, seeds, negative_gradient = _make_native_feature_case(
+        model, lithium_water, tmp_path
+    )
+    token = native._forward_features(*inputs)
+    actual = native._feature_arrays(token)
+    assert len(actual) == len(expected)
+    comparisons = [
+        _oracle_comparison(
+            value,
+            reference.detach().cpu().numpy(),
+            label=f"features[{layer}]",
+            rtol=1e-7,
+            atol=1e-9,
+        )
+        for layer, (value, reference) in enumerate(zip(actual, expected, strict=True))
+    ]
+    native._reverse_features_host(token, [value.numpy() for value in seeds])
+    comparisons.append(
+        _oracle_comparison(
+            np.asarray(native.node_forces).reshape(-1, 3),
+            negative_gradient,
+            label="arbitrary_seed_negative_edge_gradient",
+            rtol=1e-7,
+            atol=1e-9,
+        )
+    )
+    with path.open("rb") as stream:
+        checkpoint_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+    report = {
+        "checkpoint_sha256": checkpoint_sha256,
+        "native_class": type(native).__name__,
+        "random_seed": 8713,
+        "comparisons": comparisons,
+    }
+    encoded = json.dumps(report, sort_keys=True)
+    record_property("real_h512_s_native_feature_vjp_oracle", encoded)
+    print("POLAR_NATIVE_FEATURE_VJP_ORACLE " + encoded)
+    assert all(value["max_normalized_ratio"] <= 1 for value in comparisons), encoded
 
 
 def test_native_features_and_arbitrary_seed_vjp_match_upstream(native_feature_case):

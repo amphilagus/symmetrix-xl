@@ -124,8 +124,14 @@ def explicit_status(data):
     return "PENDING"
 
 
-def failed_marker(evidence, directory, completed_path=None, complete=False):
-    for name in ("failure.json", "benchmark-failure.json"):
+def failed_marker(
+    evidence,
+    directory,
+    completed_path=None,
+    complete=False,
+    names=("failure.json", "benchmark-failure.json"),
+):
+    for name in names:
         path = directory / name
         value, error = evidence.read(path)
         if error or value is not None:
@@ -777,6 +783,15 @@ def render(root):
                 else explicit_status(built)
             )
         )
+        build_failure_path, build_failure = failed_marker(
+            evidence,
+            directory,
+            built_path,
+            build_status == "PASSED",
+            names=("failure.json", "build-failure.json"),
+        )
+        if build_failure:
+            build_status, built_error = "FAILED", build_failure
         version_path, version, version_error = evidence.first(
             [directory / "version.json", directory / "version.txt"], version=True
         )
@@ -834,7 +849,11 @@ def render(root):
                 probe.get("device_environment", {}).get("execution_space", "未提供"),
                 probe.get("device_environment", {}).get("device_name", "未提供"),
                 LABELS[identity_status] + "；" + identity_note,
-                link(built_path) if built_path.is_file() else "—",
+                link(built_path)
+                if built_path.is_file()
+                else link(build_failure_path)
+                if build_failure_path
+                else "—",
                 link(version_path) if version_path.is_file() else "—",
             )
         )

@@ -2,8 +2,9 @@
 """Generate an evidence-only Markdown POLAR report without importing model code.
 
 Read deployment manifests and experiment records; never run a model, a test,
-or a benchmark. Missing and partial evidence stays pending. --output must be
-outside every Git checkout, including the deployed source checkout.
+or a benchmark. Missing and partial required evidence stays pending; an explicit,
+verified user scope reduction is reported separately. --output must be outside
+every Git checkout, including the deployed source checkout.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 import xml.etree.ElementTree as ET
 
@@ -1121,7 +1123,208 @@ def module_diagnostics(evidence):
     return summaries, modules, stages, memory, synchronizations, checks
 
 
-def pipeline_records(evidence):
+def cpu_performance_scope(evidence):
+    """Apply only an explicit, integrity-checked user scope reduction."""
+    path = evidence.root / "manifests/qualification/cpu-omp-scope.json"
+    manifest, error = evidence.read(path)
+    scope = {"required": WATERS, "omitted": (), "pipeline": None}
+    defaults = [
+        ("CPU 数值验证", "64/128/256/512 水；范围不变", "默认协议"),
+        ("CPU NVE", "64 水，100/1000 步；范围不变", "默认协议"),
+        ("GPU 性能", "sm80/sm90 各 64/128/256/512 水；范围不变", "默认协议"),
+        ("CPU 模块诊断", "仍为必需项", "默认协议"),
+    ]
+    if manifest is None and not error:
+        return (
+            scope,
+            [("CPU 性能", "未提供缩减清单；仍要求四尺寸", "未推断豁免"), *defaults],
+            [],
+        )
+
+    try:
+        if error:
+            raise ValueError(error)
+        if (
+            not isinstance(manifest.get("schema"), int)
+            or isinstance(manifest["schema"], bool)
+            or manifest["schema"] != 1
+        ):
+            raise ValueError("不支持的 scope schema")
+        if manifest.get("status") != "USER_APPROVED_SCOPE_REDUCTION":
+            raise ValueError("scope 没有明确的用户批准状态")
+        if not all(
+            isinstance(manifest.get(key), str) and manifest[key].strip()
+            for key in ("user_instruction", "source_commit")
+        ):
+            raise ValueError("scope 缺少实际用户指示或 source_commit")
+        groups = []
+        for key in (
+            "required_cpu_performance_waters",
+            "omitted_cpu_performance_waters",
+        ):
+            values = manifest.get(key)
+            if (
+                not isinstance(values, list)
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    for value in values
+                )
+                or len(values) != len(set(values))
+                or not set(values).issubset(WATERS)
+            ):
+                raise ValueError(key + " 必须是无重复的 WATERS 子集")
+            groups.append(set(values))
+        required, omitted = groups
+        if (
+            required & omitted
+            or required | omitted != set(WATERS)
+            or 64 not in required
+        ):
+            raise ValueError(
+                "required/omitted 必须无重叠、完整分割四尺寸，且 required 含 64"
+            )
+        if (
+            manifest.get("required_cpu_validation_waters") != list(WATERS)
+            or manifest.get("required_cpu_md_waters") != [64]
+            or manifest.get("required_cpu_md_steps") != [100, 1000]
+            or manifest.get("cpu_module_diagnostic_required") is not True
+            or manifest.get("partial_results_retained") is not True
+        ):
+            raise ValueError(
+                "scope 必须保留四尺寸数值验证、64 水 NVE、模块诊断及部分结果"
+            )
+        job_ids = manifest.get("stopped_job_ids")
+        if (
+            not isinstance(job_ids, list)
+            or not job_ids
+            or any(
+                not isinstance(value, str) or not value.isdigit() for value in job_ids
+            )
+        ):
+            raise ValueError("stopped_job_ids 无效")
+        declared_pipeline = Path(manifest["pipeline_before_stop"])
+        if (
+            not declared_pipeline.is_absolute()
+            or declared_pipeline.name != "pipeline.json"
+            or declared_pipeline.parts[-4:-2] != ("manifests", "qualification")
+        ):
+            raise ValueError("pipeline_before_stop 必须指向原部署 qualification 流水线")
+        declared_root = declared_pipeline.parents[3]
+
+        def checked_artifact(value, expected_hash):
+            artifact = Path(value)
+            if artifact.is_absolute():
+                artifact = artifact.relative_to(declared_root)
+            artifact = (evidence.root / artifact).resolve()
+            if (
+                not artifact.is_relative_to(evidence.root.resolve())
+                or not artifact.is_file()
+            ):
+                raise ValueError("scope 引用的证据缺失或映射越界：" + str(value))
+            digest = file_hash(artifact)
+            evidence.file_inventory[str(artifact)] = digest
+            if digest != expected_hash:
+                raise ValueError("scope 引用的证据 SHA-256 不一致：" + str(value))
+            return artifact
+
+        pipeline_path = checked_artifact(
+            manifest["pipeline_before_stop"], manifest["pipeline_before_stop_sha256"]
+        )
+        pipeline, pipeline_error = evidence.read(pipeline_path)
+        if pipeline_error:
+            raise ValueError(pipeline_error)
+        pipeline_job = str(pipeline.get("slurm_job_id", ""))
+        if pipeline_job not in job_ids:
+            raise ValueError("原流水线 slurm_job_id 不在 stopped_job_ids 中")
+        after_path = checked_artifact(
+            manifest["slurm_after_stop"], manifest["slurm_after_stop_sha256"]
+        )
+        states = {}
+        for match in re.finditer(
+            r"\bJobId=(\d+)\b(.*?)(?=\bJobId=|\Z)",
+            after_path.read_text(errors="replace"),
+            re.DOTALL,
+        ):
+            state = re.search(r"\bJobState=(\w+)", match[2])
+            exit_code = re.search(r"\bExitCode=([\d:]+)", match[2])
+            if state:
+                states[match[1]] = state[1] + (
+                    "; ExitCode=" + exit_code[1] if exit_code else ""
+                )
+        if pipeline_job not in states or not set(states).issubset(job_ids):
+            raise ValueError("停止后 Slurm 证据没有对应 stopped_job_ids 的实际状态")
+        before_paths = sorted(
+            pipeline_path.parent.glob("slurm-before-user-truncation*.txt")
+        )
+        for before_path in before_paths:
+            evidence.file_inventory[str(before_path)] = file_hash(before_path)
+        raw_status = (pipeline or {}).get("status", "未提供")
+        state_note = "；".join(f"{job}: {state}" for job, state in states.items())
+        scope.update(
+            required=tuple(sorted(required)),
+            omitted=tuple(sorted(omitted)),
+            pipeline=pipeline_path,
+            raw_status=raw_status,
+            slurm_states=states,
+            pipeline_job=pipeline_job,
+            state_note=state_note,
+            after_path=after_path,
+            manifest=path,
+        )
+        rows = [
+            ("实际用户指示", manifest["user_instruction"], link(path)),
+            (
+                "范围依据",
+                manifest["status"] + "；源提交 " + manifest["source_commit"],
+                link(path),
+            ),
+            ("CPU 必需性能", "/".join(map(str, sorted(required))) + " 水", link(path)),
+            (
+                "CPU 用户批准省略",
+                "/".join(map(str, sorted(omitted)))
+                + " 水；未完成/未测，不计作通过或待完成",
+                link(path),
+            ),
+            *[(name, note, link(path)) for name, note, _ in defaults],
+            (
+                "原流水线快照",
+                "原记录 " + str(raw_status) + "；保留原文件，不回写状态",
+                link(pipeline_path),
+            ),
+            (
+                "按用户指示停止",
+                "manifest 记录作业 "
+                + "/".join(job_ids)
+                + "；停止后 Slurm 实测 "
+                + state_note,
+                link(after_path),
+            ),
+        ]
+        rows.extend(
+            ("停止前 Slurm 快照", "原始停止前状态；不代表当前仍运行", link(value))
+            for value in before_paths
+        )
+        missing = sorted(set(job_ids) - set(states))
+        if missing:
+            rows.append(
+                (
+                    "停止状态证据边界",
+                    "/".join(missing)
+                    + " 仅有 manifest 停止记录，未提供对应停止后 Slurm 文本",
+                    link(path),
+                )
+            )
+        return scope, rows, []
+    except (KeyError, TypeError, ValueError, OSError) as failure:
+        note = "缩减清单未通过核对；仍要求 CPU 四尺寸性能：" + str(failure)
+        return (
+            scope,
+            [("CPU 性能", note, link(path)), *defaults],
+            [("FAILED", "CPU 用户批准范围证据", note)],
+        )
+
+
+def pipeline_records(evidence, cpu_scope):
     rows = []
     paths = sorted((evidence.root / "benchmark/gpu-pair").glob("*/pipeline.json"))
     paths.extend(
@@ -1141,15 +1344,40 @@ def pipeline_records(evidence):
                 row.get("status") == "passed" and row.get("returncode") == 0
                 for row in stages
             )
+            status = "失败" if record_error else LABELS[explicit_status(record)]
+            note = (
+                record_error
+                or "; ".join(str(row.get("output", "未提供")) for row in stages)
+                or str(record.get("profiles", "未提供"))
+            )
+            proof = link(record_path) if record_path.is_file() else "未提供"
+            if record_path.resolve() == cpu_scope.get("pipeline"):
+                cancelled = cpu_scope["slurm_states"][
+                    cpu_scope["pipeline_job"]
+                ].startswith("CANCELLED")
+                status = "按用户指示停止" + (
+                    f"（原记录 {cpu_scope['raw_status']}；Slurm CANCELLED）"
+                    if cancelled
+                    else f"（原记录 {cpu_scope['raw_status']}；停止后 Slurm 见证据）"
+                )
+                note += (
+                    "；"
+                    + cpu_scope["state_note"]
+                    + "；获准省略的 CPU 大尺寸性能不转记为通过或数值失败"
+                )
+                proof += (
+                    "；"
+                    + link(cpu_scope["manifest"])
+                    + "；"
+                    + link(cpu_scope["after_path"])
+                )
             rows.append(
                 (
                     f"{record.get('profile', 'controller')}/{path.parent.name}",
-                    "失败" if record_error else LABELS[explicit_status(record)],
+                    status,
                     f"{completed}/{len(stages)}" if stages else "—",
-                    record_error
-                    or "; ".join(str(row.get("output", "未提供")) for row in stages)
-                    or str(record.get("profiles", "未提供")),
-                    link(record_path) if record_path.is_file() else "未提供",
+                    note,
+                    proof,
                 )
             )
     return rows
@@ -1157,6 +1385,7 @@ def pipeline_records(evidence):
 
 def render(root):
     evidence = Evidence(root)
+    cpu_scope, scope_rows, scope_checks = cpu_performance_scope(evidence)
     (
         checks,
         build_rows,
@@ -1170,6 +1399,7 @@ def render(root):
         memory_rows,
         state_rows,
     ) = ([] for _ in range(11))
+    checks.extend(scope_checks)
     contract_path, contract, error = evidence.first(
         [root / "manifests/model-contract.json"]
     )
@@ -1546,26 +1776,52 @@ def render(root):
                     "PENDING",
                     "计时记录存在，但实际 Torch/POLAR 栈严格 doctor 尚未为 ok",
                 )
-            if formal:
+            omitted = profile == "cpu-omp" and waters in cpu_scope["omitted"]
+            display_status = LABELS[status]
+            if omitted:
+                display_status = "用户批准省略：未完成/未测"
+                note = (
+                    "未计作通过或待完成；保留部分 worker 与原始协议评估："
+                    + note
+                    + "；范围依据 "
+                    + link(cpu_scope["manifest"])
+                )
+            elif formal:
                 checks.append((status, f"{profile}/{waters}/performance", note))
             else:
                 note += "；历史 CPU 诊断，不计作正式性能资格"
             executors = (summary or {}).get("executors", {})
+            worker_counts = Counter(data.get("executor") for _, data in workers)
+            proof = (
+                link(path)
+                if path.is_file()
+                else (link(failure_path) if failure_path else "—")
+            )
+            if omitted:
+                proof = (
+                    "；".join(
+                        ([proof] if proof != "—" else [])
+                        + [link(worker_path) for worker_path, _ in workers]
+                    )
+                    or "未找到 worker/汇总记录"
+                )
             perf_rows.append(
                 (
                     profile,
-                    role,
+                    "用户缩减的性能范围" if omitted else role,
                     waters,
-                    LABELS[status],
-                    fmt(executors.get("original", {}).get("repeats")),
-                    fmt(executors.get("candidate", {}).get("repeats")),
+                    display_status,
+                    f"记录 {worker_counts['original']}/3"
+                    if omitted
+                    else fmt(executors.get("original", {}).get("repeats")),
+                    f"记录 {worker_counts['candidate']}/3"
+                    if omitted
+                    else fmt(executors.get("candidate", {}).get("repeats")),
                     fmt(executors.get("original", {}).get("median_us_per_atom_step")),
                     fmt(executors.get("candidate", {}).get("median_us_per_atom_step")),
                     fmt((summary or {}).get("speedup_original_over_candidate")),
                     note,
-                    link(path)
-                    if path.is_file()
-                    else (link(failure_path) if failure_path else "—"),
+                    proof,
                 )
             )
             stages = {}
@@ -1613,7 +1869,7 @@ def render(root):
         module_checks,
     ) = module_diagnostics(evidence)
     checks.extend(module_checks)
-    pipeline_rows = pipeline_records(evidence)
+    pipeline_rows = pipeline_records(evidence, cpu_scope)
     counts = {status: sum(row[0] == status for row in checks) for status in LABELS}
     lines = [
         "# MACE-POLAR 适配资格报告",
@@ -1625,6 +1881,8 @@ def render(root):
         "本报告只读取现有文件，没有运行模型、测试或 MD。待完成表示未找到完成证据或正式协议不完整，不表示任务已经调度；失败记录不会被缺失的新记录覆盖。只有时间更新且正式协议完整通过的记录可以替代历史失败，历史证据仍单列。合约清点只证明序列化/权重归属，不证明数值正确性。",
         "",
         "正式 CPU 优先使用独立的 cpu-omp 配置；它必须在真实 Torch/POLAR 能量和力计算后通过严格 doctor。旧 cpu 的数值、MD 和计时记录保留为历史诊断，不转记为 cpu-omp 的结果，也不计入正式配置的完成项目。GPU 编译提交与后续资格脚本提交分别记录。",
+        "",
+        "用户批准省略的 CPU 大尺寸性能项独立展示，不计入上方通过、待完成或失败数量；其部分 worker、原始流水线与 Slurm 停止记录仍保留。缩减仅在显式 scope 清单及关联原始证据通过完整性检查后生效，缺少清单时默认要求 CPU 四尺寸性能。科学验证、64 水 NVE、GPU 四尺寸性能和完整回归的原始状态不受此缩减影响。",
         "",
         "## 通过、待完成与失败",
         "",
@@ -1646,6 +1904,11 @@ def render(root):
             ]
         )
     sections = [
+        (
+            "本轮执行范围与用户批准缩减",
+            ["项目", "实际要求/记录边界", "依据"],
+            scope_rows,
+        ),
         (
             "构建与设备",
             [
@@ -1938,7 +2201,9 @@ def render(root):
         [
             "## 判定边界",
             "",
-            "正式物理阈值：总胞能量误差 ≤ 1e-4 eV，最大力分量误差 ≤ 1e-5 eV/Å，初始及两轮更新后的 |Q−1| ≤ 1e-9 e、|spin population| ≤ 1e-9。水合壳按 O–Li 最小镜像距离 ≤ 3.2 Å 选取整分子。四尺寸要求 validation/benchmark；NVE 只要求 64 水代表体系，0.25 fs、100/1000 步；漂移仅报告实际数值，没有自创漂移阈值。正式性能为 FP64、原模型/候选各 3 次独立进程、每块至少 10 秒。",
+            "正式物理阈值：总胞能量误差 ≤ 1e-4 eV，最大力分量误差 ≤ 1e-5 eV/Å，初始及两轮更新后的 |Q−1| ≤ 1e-9 e、|spin population| ≤ 1e-9。水合壳按 O–Li 最小镜像距离 ≤ 3.2 Å 选取整分子。所有正式配置仍要求四尺寸 validation；GPU 仍要求四尺寸 benchmark；本报告 CPU 必需 benchmark 尺寸为 "
+            + "/".join(map(str, cpu_scope["required"]))
+            + " 水，以独立范围表为准。NVE 只要求 64 水代表体系，0.25 fs、100/1000 步；漂移仅报告实际数值，没有自创漂移阈值。正式性能为 FP64、原模型/候选各 3 次独立进程、每块至少 10 秒。",
             "",
             "MD 可以单独记录不同的 CPU 线程策略；实际 affinity、线程环境、native concurrency、OpenBLAS 全局线程数和 omp_max_active_levels 分列。OpenMP OpenBLAS 的实际全局线程数可以为 8，即使 OPENBLAS_NUM_THREADS=1；共享 OpenMP 且嵌套层数为 1 不等于全局 BLAS 线程数为 1，也不单独证明每次 BLAS 调用启动多少 workers。轨迹运行时间不替代严格单核的正式 benchmark，缺少实际计数时不从环境变量推断。",
             "",
@@ -1957,7 +2222,7 @@ def render(root):
             "## 按现有缺口继续",
             "",
             "1. 若上表 cpu-omp 仍有缺口，先补全其构建身份、真实 Torch/POLAR 严格 doctor 和独立 oracle；旧 cpu 的长轨迹可保留科学对照证据，但不能替代新配置的资格。",
-            "2. 补全正式配置的四尺寸 validation/benchmark，以及 64 水代表体系的 100/1000 步 NVE 和各配置模块诊断。部分轨迹仅报告最后实际采样步，不将等待或已提交当作完成。",
+            "2. 按独立范围表补全仍必需的 validation/benchmark、64 水代表体系的 100/1000 步 NVE 和各配置模块诊断；获准省略的 CPU 性能项保留为未完成/未测，不再要求补测。部分轨迹仅报告最后实际采样步，不将等待或已提交当作完成。",
             "3. 正式速度对比需原模型/候选各三个独立进程，每块至少十秒、FP64、单物理核、profile=False，并保留各 worker 初态、二进制和运行库身份。没有完整计时证据前不填入速度结论。",
             "4. 完整回归仍未全通过时，单独记录环境/API 限制和干净上游复现，不放宽物理或数值阈值来消除失败。",
             "",

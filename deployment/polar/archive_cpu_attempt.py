@@ -90,35 +90,70 @@ def active_jobs(root):
 
 def process_probe_code(paths):
     # Compatible with compute nodes' system Python 2.7; no numerical imports.
-    return """import errno,json,os,socket
+    return """import errno,json,os,pwd,socket
 prefixes=PREFIXES
 hits=[]
 errors=[]
+excluded=[]
+uid=os.getuid()
+user=pwd.getpwuid(uid).pw_name
 for name in os.listdir('/proc'):
  if not name.isdigit() or int(name)==os.getpid(): continue
  base='/proc/'+name
  try:
-  if os.stat(base).st_uid != os.getuid(): continue
+  if os.stat(base).st_uid != uid: continue
  except OSError: continue
  values=[]
+ unreadable=[]
+ denied_only=True
+ argv0=''
  for leaf in ('cmdline','maps'):
   try:
-   with open(base+'/'+leaf,'rb') as stream: values.append(stream.read().decode('utf-8','replace'))
+   with open(base+'/'+leaf,'rb') as stream: value=stream.read().decode('utf-8','replace')
+   values.append(value)
+   if leaf=='cmdline': argv0=value.split('\\x00',1)[0]
   except IOError as error:
-   if error.errno not in (errno.ENOENT,errno.ESRCH): errors.append([name,leaf,str(error)])
+   if error.errno not in (errno.ENOENT,errno.ESRCH):
+    unreadable.append([name,leaf,str(error)])
+    denied_only=denied_only and error.errno in (errno.EACCES,errno.EPERM)
  for leaf in ('cwd','exe'):
   try: values.append(os.readlink(base+'/'+leaf))
   except OSError as error:
-   if error.errno not in (errno.ENOENT,errno.ESRCH): errors.append([name,leaf,str(error)])
+   if error.errno not in (errno.ENOENT,errno.ESRCH):
+    unreadable.append([name,leaf,str(error)])
+    denied_only=denied_only and error.errno in (errno.EACCES,errno.EPERM)
  try:
   for fd in os.listdir(base+'/fd'):
    try: values.append(os.readlink(base+'/fd/'+fd))
    except OSError: pass
  except OSError as error:
-  if error.errno not in (errno.ENOENT,errno.ESRCH): errors.append([name,'fd',str(error)])
+  if error.errno not in (errno.ENOENT,errno.ESRCH):
+   unreadable.append([name,'fd',str(error)])
+   denied_only=denied_only and error.errno in (errno.EACCES,errno.EPERM)
  matched=[prefix for prefix in prefixes if any(prefix in value for value in values)]
  if matched: hits.append({'pid':int(name),'paths':matched})
-print(json.dumps({'node':socket.gethostname().split('.')[0],'uid':os.getuid(),'hits':hits,'unreadable_own_processes':errors}))
+ if not unreadable: continue
+ status={}
+ comm=''
+ try:
+  with open(base+'/status') as stream:
+   for line in stream:
+    key,separator,value=line.partition(':')
+    if key in ('Name','Uid'): status[key]=value.strip()
+  with open(base+'/comm') as stream: comm=stream.read().strip()
+ except (IOError,OSError): pass
+ own_uids=status.get('Uid','').split()==[str(uid)]*4
+ known_auth=(
+  status.get('Name')==comm=='sshd' and argv0.startswith('sshd: '+user+'@')
+  or status.get('Name')==comm=='ssh-agent' and argv0 in ('ssh-agent','/usr/bin/ssh-agent')
+  or status.get('Name')==comm=='gnome-keyring-d' and argv0=='/usr/bin/gnome-keyring-daemon'
+ )
+ if denied_only and own_uids and known_auth:
+  excluded.append({'pid':int(name),'name':status['Name'],'comm':comm,'uid':uid,
+   'program':'sshd' if comm=='sshd' else argv0,
+   'unreadable_leaves':[row[1] for row in unreadable]})
+ else: errors.extend(unreadable)
+print(json.dumps({'node':socket.gethostname().split('.')[0],'uid':uid,'hits':hits,'unreadable_own_processes':errors,'excluded_auth_daemons':excluded}))
 """.replace("PREFIXES", repr([str(path) for path in paths]))
 
 

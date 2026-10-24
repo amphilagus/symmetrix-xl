@@ -106,9 +106,12 @@ def library_paths(root, profile):
     native += [str(p) for p in sorted(site.glob("cuequivariance_ops*/lib"))]
     return [
         str(base / "glibc-2.28/lib"),
+        *([str(base / "openmp")] if profile == "cpu-omp" else []),
         str(base / "gcc-runtime/lib64"),
         str(base / "python-base/lib"),
-        str(root.parent / "opt/openblas/0.3.28-gcc9.4.0/lib"),
+        str(root / "opt/openblas-omp/lib")
+        if profile == "cpu-omp"
+        else str(root.parent / "opt/openblas/0.3.28-gcc9.4.0/lib"),
         str(root / "opt" / profile / "lib/polar-cuda-loader-links"),
         str(site / "torch/lib"),
         *native,
@@ -159,6 +162,38 @@ def install_cuda_loader_links(root, profile):
     return inventory
 
 
+def install_cpu_openmp_loader(root, profile):
+    """Register all Torch/compiler GOMP dependency names for one owned inode."""
+    manifest = json.loads((root / "manifests/cpu-toolchain.json").read_text())
+    target = root / "opt/base/openmp/libgomp.so.1.0.0"
+    if (
+        manifest.get("status") != "BUILT"
+        or sha256(target) != manifest["openmp"]["sha256"]
+    ):
+        raise RuntimeError("Qualified CPU OpenMP toolchain is missing or changed")
+    blas = root / "opt/openblas-omp/lib/libopenblas.so"
+    if (
+        not blas.is_file()
+        or sha256(blas) != manifest["openblas"]["files"]["lib/libopenblas.so"]
+    ):
+        raise RuntimeError("Qualified CPU OpenMP OpenBLAS is missing or changed")
+    site = root / "opt" / profile / "lib/python3.12/site-packages"
+    names = ["libgomp.so.1"]
+    names.extend(
+        path.name for path in sorted((site / "torch/lib").glob("libgomp-*.so.1"))
+    )
+    for name in names:
+        alias = target.parent / name
+        if alias.is_symlink() and os.readlink(alias) == target.name:
+            continue
+        if alias.exists() or alias.is_symlink():
+            raise FileExistsError(f"Unexpected OpenMP loader alias: {alias}")
+        alias.symlink_to(target.name)
+    record = {"path": str(target), "sha256": sha256(target), "preload_names": names}
+    write_json(root / "opt" / profile / "lib/polar-openmp-loader.json", record)
+    return record
+
+
 def install_wrappers(root, profile):
     prefix = root / "opt" / profile
     cuda_loader_links = install_cuda_loader_links(root, profile)
@@ -171,6 +206,29 @@ def install_wrappers(root, profile):
     script += (
         "export NVIDIA_TF32_OVERRIDE=0 PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1\n"
     )
+    if profile == "cpu-omp":
+        openmp = install_cpu_openmp_loader(root, profile)
+        child_libraries = ":".join(
+            str(path)
+            for path in (
+                root / "opt/base/openmp",
+                root / "opt/base/gcc-runtime/lib64",
+                root / "opt/openblas-omp/lib",
+            )
+        )
+        # ld.so --library-path is process-local. Controlled non-glibc paths
+        # also let compiler/probe subprocesses resolve inherited preload names.
+        script += (
+            "export LD_LIBRARY_PATH="
+            + shlex.quote(child_libraries)
+            + '"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n'
+        )
+        # glibc 2.28 lacks the newer ld.so --preload option. Preload both the
+        # normal SONAME and Torch's hashed dependency name before any import.
+        script += (
+            "export LD_PRELOAD=" + shlex.quote(":".join(openmp["preload_names"])) + "\n"
+        )
+        script += "export OMP_MAX_ACTIVE_LEVELS=1\n"
     for key, suffix in (
         ("XDG_CACHE_HOME", "xdg"),
         ("CUDA_CACHE_PATH", "cuda"),
@@ -196,7 +254,7 @@ def install_wrappers(root, profile):
     return cuda_loader_links
 
 
-def environment(root, donor):
+def environment(root, donor, profile=None):
     env = os.environ.copy()
     for key in ("PYTHONHOME", "PYTHONPATH", "LD_PRELOAD", "LD_AUDIT"):
         env.pop(key, None)
@@ -247,6 +305,18 @@ def environment(root, donor):
         PIP_DISABLE_PIP_VERSION_CHECK="1",
         UV_OFFLINE="1",
     )
+    if profile == "cpu-omp":
+        blas = root / "opt/openblas-omp"
+        env["CMAKE_PREFIX_PATH"] = str(blas)
+        env["LIBRARY_PATH"] = str(blas / "lib")
+        env["CPATH"] = str(blas / "include")
+        env["LD_LIBRARY_PATH"] = (
+            str(root / "opt/base/openmp")
+            + ":"
+            + str(blas / "lib")
+            + ":"
+            + env["LD_LIBRARY_PATH"]
+        )
     return env
 
 
@@ -256,7 +326,7 @@ def prepare(root, donor, profile):
     lock = json.loads((root / "deployment/assets.lock.json").read_text())
     source = donor / "src/polar" / RUNTIME_ID
     prefix = root / "opt" / profile
-    env = environment(root, donor)
+    env = environment(root, donor, profile)
     base = root / "opt/base"
     loader = base / "glibc-2.28/lib/ld-2.28.so"
     command = [
@@ -377,6 +447,11 @@ def prepare(root, donor, profile):
             },
             "requirements_sha256": sha256(root / "deployment/requirements.lock.txt"),
             "cuda_loader_links": cuda_loader_links,
+            "cpu_openmp_loader": json.loads(
+                (prefix / "lib/polar-openmp-loader.json").read_text()
+            )
+            if profile == "cpu-omp"
+            else None,
         },
     )
 
@@ -386,7 +461,9 @@ def main():
     parser.add_argument("action", choices=("stage", "prepare"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--donor", type=Path, required=True)
-    parser.add_argument("--profile", choices=("cpu", "sm80", "sm90"), default="cpu")
+    parser.add_argument(
+        "--profile", choices=("cpu", "cpu-omp", "sm80", "sm90"), default="cpu"
+    )
     args = parser.parse_args()
     root, donor = args.root.resolve(), args.donor.resolve()
     if root == donor or root.parent != donor.parent:

@@ -17,7 +17,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--donor", type=Path, required=True)
-    parser.add_argument("--profile", choices=("cpu", "sm80", "sm90"), required=True)
+    parser.add_argument(
+        "--profile", choices=("cpu", "cpu-omp", "sm80", "sm90"), required=True
+    )
     parser.add_argument("--jobs", type=int, default=6)
     parser.add_argument(
         "--qualify-only",
@@ -32,7 +34,8 @@ def main():
         raise ValueError("Build root must be independent of the donor")
     profile = args.profile
     source = root / "src/symmetrix-xl"
-    env = environment(root, donor)
+    is_cpu = profile in ("cpu", "cpu-omp")
+    env = environment(root, donor, profile)
     env["SYMMETRIX_POLAR_BUILD_MODE"] = "1"
     env["PIP_FIND_LINKS"] = " ".join(
         str(p)
@@ -57,7 +60,9 @@ def main():
         check=True,
     )
     wheels = root / "build/wheels"
-    wheels.mkdir(exist_ok=True)
+    if profile == "cpu-omp":
+        wheels /= profile
+    wheels.mkdir(parents=True, exist_ok=True)
     manifest = root / "manifests/build" / profile
     manifest.mkdir(parents=True, exist_ok=True)
     previous = [p for p in manifest.iterdir() if p.is_file()]
@@ -88,7 +93,7 @@ def main():
     frontend = [str(python), "tools/symmetrix_build.py"]
     if args.qualify_only:
         pass
-    elif profile == "cpu":
+    elif is_cpu:
         command = [
             *frontend,
             "wheel",
@@ -173,10 +178,19 @@ def main():
         ]
         subprocess.run(command, cwd=source, env=env, check=True)
     env.pop("SYMMETRIX_POLAR_BUILD_MODE", None)
-    env["SYMMETRIX_BACKEND"] = "cpu" if profile == "cpu" else "cuda12-" + profile
+    env["SYMMETRIX_BACKEND"] = "cpu" if is_cpu else "cuda12-" + profile
     env["SYMMETRIX_POLAR_MODEL"] = str(
         root / "forcefields/polar1s/MACE-POLAR-1-S.model"
     )
+    for name in (
+        "OMP_NUM_THREADS",
+        "KOKKOS_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        env[name] = "1"
     for label, command in (
         (
             "version",
@@ -241,6 +255,20 @@ def main():
                         raise RuntimeError(
                             "Native probe source fingerprint mismatch: " + key
                         )
+    if profile == "cpu-omp":
+        subprocess.run(
+            [
+                str(python),
+                "deployment/polar/runtime_doctor.py",
+                "--checkpoint",
+                env["SYMMETRIX_POLAR_MODEL"],
+                "--output",
+                str(manifest / "doctor-torch-polar.json"),
+            ],
+            cwd=source,
+            env=env,
+            check=True,
+        )
     subprocess.run(
         [
             str(python),
@@ -280,13 +308,22 @@ def main():
                 env=env,
                 text=True,
             ).splitlines(),
-            "shared_openblas_sha256": {
+            "openblas_sha256": {
                 str(p): sha256(p)
                 for p in sorted(
-                    (root.parent / "opt/openblas/0.3.28-gcc9.4.0/lib").glob("*.so*")
+                    (
+                        root / "opt/openblas-omp/lib"
+                        if profile == "cpu-omp"
+                        else root.parent / "opt/openblas/0.3.28-gcc9.4.0/lib"
+                    ).glob("*.so*")
                 )
                 if p.is_file()
             },
+            "cpu_toolchain_manifest_sha256": (
+                sha256(root / "manifests/cpu-toolchain.json")
+                if profile == "cpu-omp"
+                else None
+            ),
         },
     )
 

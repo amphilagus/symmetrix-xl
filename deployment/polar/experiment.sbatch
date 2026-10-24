@@ -17,7 +17,7 @@ export MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export SYMMETRIX_BACKEND=cpu
 device=cpu
 bridge=host
-if [[ "$profile" != cpu ]]; then
+if [[ "$profile" != cpu && "$profile" != cpu-omp ]]; then
     selected_gpu=$("$root/opt/$profile/bin/python" \
         "$root/src/symmetrix-xl/deployment/polar/select_device.py" --profile "$profile")
     export CUDA_VISIBLE_DEVICES="$selected_gpu"

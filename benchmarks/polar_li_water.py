@@ -389,6 +389,96 @@ def synchronize(device):
         torch.cuda.synchronize(device)
 
 
+def hardware_provenance(device):
+    selected_cpu = EARLY_EXECUTION_ENVIRONMENT.get("selected_logical_cpu")
+    cpu = {"selected_logical_cpu": selected_cpu, "source": "/proc/cpuinfo"}
+    path = Path("/proc/cpuinfo")
+    if path.is_file():
+        records = []
+        for block in path.read_text(errors="replace").split("\n\n"):
+            fields = {}
+            for line in block.splitlines():
+                key, separator, value = line.partition(":")
+                if separator:
+                    fields[key.strip()] = value.strip()
+            if fields:
+                records.append(fields)
+        selected = next(
+            (
+                record
+                for record in records
+                if record.get("processor") == str(selected_cpu)
+            ),
+            None,
+        )
+        if selected is not None:
+            cpu.update(
+                {
+                    name: selected.get(name)
+                    for name in (
+                        "processor",
+                        "vendor_id",
+                        "model name",
+                        "cpu family",
+                        "model",
+                        "stepping",
+                        "physical id",
+                        "core id",
+                    )
+                }
+            )
+            cpu["available"] = True
+        else:
+            cpu.update(
+                available=False,
+                reason="Selected logical CPU has no /proc/cpuinfo stanza",
+            )
+    else:
+        cpu.update(available=False, reason="/proc/cpuinfo is unavailable")
+    result = {
+        "nodename": platform.node(),
+        "cpu": cpu,
+        "slurm": {
+            name: os.environ.get(name)
+            for name in (
+                "SLURM_JOB_ID",
+                "SLURM_STEP_ID",
+                "SLURMD_NODENAME",
+                "SLURM_JOB_NODELIST",
+                "SLURM_NODEID",
+                "SLURM_PROCID",
+                "SLURM_LOCALID",
+            )
+        },
+        "gpu": {
+            "queried": False,
+            "reason": "CPU execution; CUDA device APIs were not queried",
+        },
+    }
+    if device and device.startswith("cuda"):
+        import torch
+
+        current = torch.cuda.current_device()
+        ordinal = torch.device(device).index
+        ordinal = current if ordinal is None else ordinal
+        properties = torch.cuda.get_device_properties(ordinal)
+        uuid = getattr(properties, "uuid", None)
+        result["gpu"] = {
+            "queried": True,
+            "source": "torch.cuda.get_device_properties",
+            "device_name": properties.name,
+            "device_capability": [properties.major, properties.minor],
+            "total_memory_bytes": properties.total_memory,
+            "uuid": str(uuid) if uuid is not None else None,
+            "device_ordinal": ordinal,
+            "current_visible_ordinal": current,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "torch_cuda_build_version": torch.version.cuda,
+            "visible_ordinals_are_not_physical_gpu_indices": True,
+        }
+    return result
+
+
 def provenance(args, calculator=None, executor=None):
     versions = {}
     for distribution in importlib.metadata.distributions():
@@ -422,6 +512,7 @@ def provenance(args, calculator=None, executor=None):
         "python": sys.executable,
         "python_version": platform.python_version(),
         "platform": platform.platform(),
+        "hardware": hardware_provenance(getattr(args, "device", None)),
         "pid": os.getpid(),
         "early_execution_environment": EARLY_EXECUTION_ENVIRONMENT,
         "cpu_affinity": sorted(os.sched_getaffinity(0))
@@ -1081,7 +1172,8 @@ def benchmark_worker(args):
         "precision": "float64",
         "properties": ["energy", "forces"],
         "timestep_fs": args.timestep,
-        "temperature_initial_K": args.temperature,
+        "temperature_initial_K": initial_state["temperature_K"],
+        "temperature_requested_when_momenta_absent_K": args.temperature,
         "seed": args.seed,
         "warmup_steps_excluded": args.warmup_steps,
         "block_seconds_requested": args.seconds,

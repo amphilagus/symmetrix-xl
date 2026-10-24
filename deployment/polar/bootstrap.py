@@ -129,7 +129,7 @@ def environment(root, donor):
                LC_ALL="C", LANG="C", PYTHONNOUSERSITE="1", OMP_NUM_THREADS="1",
                OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
                CUDAToolkit_ROOT=str(cuda),
-               PATH=":".join(map(str, [gcc / "bin", public / "cmake/3.29.6-gcc9.4.0/bin", cuda / "bin", Path('/usr/bin'), Path('/bin')])),
+               PATH=":".join(map(str, [donor / "opt/git/bin", gcc / "bin", public / "cmake/3.29.6-gcc9.4.0/bin", cuda / "bin", Path('/usr/bin'), Path('/bin')])),
                LD_LIBRARY_PATH=":".join(map(str, [gcc / "lib64", donor / "opt/python/lib", public / "openblas/0.3.28-gcc9.4.0/lib", cuda / "lib64"])),
                CMAKE_PREFIX_PATH=str(public / "openblas/0.3.28-gcc9.4.0"),
                LIBRARY_PATH=str(public / "openblas/0.3.28-gcc9.4.0/lib"),

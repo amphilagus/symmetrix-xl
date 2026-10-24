@@ -10,7 +10,7 @@ set -euo pipefail
 root=$1
 profile=$2
 shift 2
-export PATH="$root/opt/$profile/bin:/usr/bin:/bin"
+export PATH="$root/opt/$profile/bin:$(dirname "$root")/mace-symmetrix-xl/opt/git/bin:/usr/bin:/bin"
 export LC_ALL=C LANG=C
 export OMP_NUM_THREADS=1 KOKKOS_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1

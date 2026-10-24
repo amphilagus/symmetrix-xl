@@ -78,6 +78,9 @@ only its MACE-like submodules would discard long-range terms.
 
 `bridge="host"` exports feature snapshots as NumPy arrays and stages adjoints
 back into the native evaluator. It is useful for CPU execution and debugging.
+Omitting `bridge`, or setting `bridge="auto"`, selects host exchange on CPU
+and DLPack on CUDA. The native and PyTorch devices must match, including the
+CUDA device ordinal; a CPU prefix is rejected for a requested CUDA calculation.
 `bridge="dlpack"` exports device-owned feature snapshots and copies adjoint
 seeds between device allocations through DLPack. It keeps CUDA force reduction
 on the device. This is a device snapshot and device-to-device copy bridge.
@@ -134,3 +137,101 @@ SYMMETRIX_POLAR_MODEL=/absolute/path/MACE-POLAR-1-S.model \
 A missing optional model skips this test; an explicitly configured nonexistent
 path fails. Report checkpoint availability and skipped tests alongside parity
 and performance results.
+
+## Li/water deployment experiments
+
+The reproducible driver is `benchmarks/polar_li_water.py`. Each prepared box
+contains exactly one Li and 64, 128, 256, or 512 complete waters, with total
+charge +1, spin multiplicity one, zero external field, full PBC, and water
+density 1 g/cm³. Larger boxes are independently constructed; a charged box is
+never repeated. Preparation uses fixed seeds, fixed-cell original-model FP64
+BFGS with at most 2000 steps and `fmax=0.05 eV/Å`, followed by 500 NVT steps
+at 300 K and 0.25 fs. Failure to converge is recorded and stops preparation.
+
+The deployed `deployment/polar/experiment.sbatch` wrapper takes the deployment
+root, runtime profile (`cpu`, `sm80`, or `sm90`), then a driver subcommand. It
+selects the profile's interpreter and backend and supplies the local checkpoint,
+device, and bridge arguments. Submit model calculations through Slurm. CPU
+allocation defaults come from the wrapper; GPU submissions must request a GPU
+matching the profile through the site's partition/resource options.
+
+From the deployed repository, for example:
+
+```bash
+DEPLOYMENT_ROOT=/absolute/path/polar-deployment
+OUTPUT_ROOT=/absolute/path/polar-results
+
+# A CPU preparation example; initial generation can be selected independently.
+sbatch deployment/polar/experiment.sbatch "$DEPLOYMENT_ROOT" cpu \
+    prepare --stage initial --waters 64 128 256 512 \
+    --output "$OUTPUT_ROOT/prepared"
+
+# Set GPU_PARTITION according to the cluster and select matching sm80 hardware.
+sbatch --partition="$GPU_PARTITION" --gres=gpu:1 \
+    deployment/polar/experiment.sbatch "$DEPLOYMENT_ROOT" sm80 \
+    prepare --stage all --waters 64 --output "$OUTPUT_ROOT/prepared"
+
+sbatch --partition="$GPU_PARTITION" --gres=gpu:1 \
+    deployment/polar/experiment.sbatch "$DEPLOYMENT_ROOT" sm80 \
+    validate --input "$OUTPUT_ROOT/prepared/water0064.equilibrated.extxyz" \
+    --output "$OUTPUT_ROOT/sm80-water0064/validation"
+
+sbatch --partition="$GPU_PARTITION" --gres=gpu:1 \
+    deployment/polar/experiment.sbatch "$DEPLOYMENT_ROOT" sm80 \
+    md --steps 100 --sample-interval 10 \
+    --input "$OUTPUT_ROOT/prepared/water0064.equilibrated.extxyz" \
+    --output "$OUTPUT_ROOT/sm80-water0064/nve100"
+
+sbatch --partition="$GPU_PARTITION" --gres=gpu:1 \
+    deployment/polar/experiment.sbatch "$DEPLOYMENT_ROOT" sm80 \
+    benchmark --repeats 3 --seconds 10 \
+    --input "$OUTPUT_ROOT/prepared/water0064.equilibrated.extxyz" \
+    --output "$OUTPUT_ROOT/sm80-water0064/benchmark"
+```
+
+Repeat the accepted procedure for each water count and runtime profile. Run
+`md --steps 1000` after the shorter trajectory passes. `prepare --stage optimize`
+and `prepare --stage equilibrate` support separate jobs; an explicit `--input`
+resumes one water count. Equilibration verifies an explicitly resumed structure's
+force convergence. Without `--input`, it requires the stored converged
+optimization record and the same checkpoint hash.
+
+Validation compares complete original and candidate energies/forces on the
+base, translated, and periodically wrapped structures. The default acceptance
+thresholds are absolute total-cell energy error ≤ `1e-4 eV`, maximum force
+component error ≤ `1e-5 eV/Å`, charge error ≤ `1e-9 e`, and spin-population error
+≤ `1e-9`, with the last two checked before and after both field updates. Force
+errors are reported separately for Li, all three atoms of hydration-shell waters
+whose oxygen lies within 3.2 Å of Li using the minimum-image distance, and the
+remaining waters. Region membership is recomputed on each sampled frame.
+
+NVE uses the prepared positions and momenta, preserving the equilibrated state.
+Only inputs without momenta receive deterministic Maxwell velocities; the
+fallback is recorded. Preparation records the NVT initial/final state hashes
+and hashes of the actual written-and-reloaded output. NVE and each timing worker
+record their initial position and velocity hashes, so the prepared state and
+original/candidate starting conditions can be audited. Same-trajectory NVE
+checks recompute the original energy and forces on sampled candidate frames
+and report total-energy drift, maximum drift per atom, and its linear slope.
+No numerical drift acceptance threshold is implied by the parity thresholds.
+
+Timing uses three independent processes per executor and complete ASE NVE
+blocks lasting at least ten seconds after warmup, including neighbor creation,
+force transfers, and the final device synchronization. Before importing NumPy,
+BLAS, PyTorch, or Kokkos, the driver pins itself and its children to one allowed
+logical CPU, excludes its SMT siblings, and sets worker counts to one. It records
+the selected logical CPU and Linux socket/core/sibling topology. Candidate
+throughput uses `profile=False` and omits diagnostic histories; one separately
+synchronized `profile=True` calculation provides stage times outside the timing
+and memory samples.
+
+JSON records include input/checkpoint hashes, Git identity, package and source
+fingerprints, actual executor and native build information, atom/water counts,
+cutoff, directed edges, precision, `us/atom/step`, and memory evidence. GPU
+polling prefers the process's total NVIDIA allocation, covering both Torch and
+native allocators. It also records all-GPU baseline/peak allocation and competing
+process IDs; global figures include other users' allocations. Torch allocator
+peaks are labeled separately. Missing counters remain unavailable. `report`
+summarizes worker JSON files only after checking that their physical inputs,
+protocols, paired initial states, and repeat identities agree. All result paths
+are explicitly selected with `--output`; generated data are not source artifacts.

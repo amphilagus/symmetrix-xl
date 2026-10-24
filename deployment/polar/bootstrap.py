@@ -5,6 +5,7 @@ The donor contains the previously qualified public dependencies. Virtual
 environments are always created afresh; only immutable runtime components,
 locked wheels and application source archives are reused.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,7 +42,17 @@ def write_json(path, value):
 def stage(root, donor):
     if root == donor or root.parent != donor.parent:
         raise ValueError("The new deployment must be a distinct sibling of the donor")
-    for name in ("src", "opt", "build", "deployment", "forcefields", "benchmark", "logs", "manifests", "tests"):
+    for name in (
+        "src",
+        "opt",
+        "build",
+        "deployment",
+        "forcefields",
+        "benchmark",
+        "logs",
+        "manifests",
+        "tests",
+    ):
         (root / name).mkdir(parents=True, exist_ok=True)
     capsule = donor / "opt/polar" / RUNTIME_ID
     base = root / "opt/base"
@@ -53,7 +64,8 @@ def stage(root, donor):
             shutil.copytree(capsule / name, target, symlinks=True)
         inventory[name] = {
             str(p.relative_to(target)): sha256(p)
-            for p in sorted(target.rglob("*")) if p.is_file()
+            for p in sorted(target.rglob("*"))
+            if p.is_file()
         }
     checkpoint = root / "forcefields/polar1s/MACE-POLAR-1-S.model"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -70,13 +82,21 @@ def stage(root, donor):
         if target.exists() and sha256(target) != sha256(original):
             raise ValueError("Existing dependency lock differs from donor")
         shutil.copy2(original, target)
-    write_json(root / "manifests/staging.json", {
-        "schema_version": 1, "donor": str(donor), "root": str(root),
-        "donor_runtime_id": RUNTIME_ID, "immutable_components": inventory,
-        "checkpoint_sha256": MODEL_SHA256,
-        "locks": {name: sha256(root / "deployment" / name)
-                  for name in ("assets.lock.json", "requirements.lock.txt")},
-    })
+    write_json(
+        root / "manifests/staging.json",
+        {
+            "schema_version": 1,
+            "donor": str(donor),
+            "root": str(root),
+            "donor_runtime_id": RUNTIME_ID,
+            "immutable_components": inventory,
+            "checkpoint_sha256": MODEL_SHA256,
+            "locks": {
+                name: sha256(root / "deployment" / name)
+                for name in ("assets.lock.json", "requirements.lock.txt")
+            },
+        },
+    )
 
 
 def library_paths(root, profile):
@@ -84,9 +104,16 @@ def library_paths(root, profile):
     site = root / "opt" / profile / "lib/python3.12/site-packages"
     native = [str(p) for p in sorted((site / "nvidia").glob("*/lib"))]
     native += [str(p) for p in sorted(site.glob("cuequivariance_ops*/lib"))]
-    return [str(base / "glibc-2.28/lib"), str(base / "gcc-runtime/lib64"),
-            str(base / "python-base/lib"), str(site / "torch/lib"),
-            *native, "/usr/lib64", "/lib64"]
+    return [
+        str(base / "glibc-2.28/lib"),
+        str(base / "gcc-runtime/lib64"),
+        str(base / "python-base/lib"),
+        str(root.parent / "opt/openblas/0.3.28-gcc9.4.0/lib"),
+        str(site / "torch/lib"),
+        *native,
+        "/usr/lib64",
+        "/lib64",
+    ]
 
 
 def install_wrappers(root, profile):
@@ -97,10 +124,16 @@ def install_wrappers(root, profile):
     script += 'if [ "${SYMMETRIX_POLAR_BUILD_MODE:-0}" != 1 ]; then unset LD_LIBRARY_PATH; fi\n'
     script += "export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 LC_ALL=C LANG=C\n"
     script += "export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1\n"
-    script += "export NVIDIA_TF32_OVERRIDE=0 PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1\n"
-    for key, suffix in (("XDG_CACHE_HOME", "xdg"), ("CUDA_CACHE_PATH", "cuda"),
-                        ("TORCH_EXTENSIONS_DIR", "torch"), ("CUEQUIVARIANCE_CACHE_DIR", "cueq"),
-                        ("SYMMETRIX_JIT_CACHE", "symmetrix")):
+    script += (
+        "export NVIDIA_TF32_OVERRIDE=0 PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1\n"
+    )
+    for key, suffix in (
+        ("XDG_CACHE_HOME", "xdg"),
+        ("CUDA_CACHE_PATH", "cuda"),
+        ("TORCH_EXTENSIONS_DIR", "torch"),
+        ("CUEQUIVARIANCE_CACHE_DIR", "cueq"),
+        ("SYMMETRIX_JIT_CACHE", "symmetrix"),
+    ):
         target = root / "build/cache" / profile / suffix
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
         script += "export " + key + "=" + shlex.quote(str(target)) + "\n"
@@ -125,16 +158,50 @@ def environment(root, donor):
     gcc = donor / "opt/gcc/12.4.0"
     public = donor.parent / "opt"
     cuda = public / "nvhpc/Linux_x86_64/24.3/cuda/12.3"
-    env.update(CC=str(gcc / "bin/gcc"), CXX=str(gcc / "bin/g++"), FC=str(gcc / "bin/gfortran"),
-               LC_ALL="C", LANG="C", PYTHONNOUSERSITE="1", OMP_NUM_THREADS="1",
-               OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
-               CUDAToolkit_ROOT=str(cuda),
-               PATH=":".join(map(str, [donor / "opt/git/bin", gcc / "bin", public / "cmake/3.29.6-gcc9.4.0/bin", cuda / "bin", Path('/usr/bin'), Path('/bin')])),
-               LD_LIBRARY_PATH=":".join(map(str, [gcc / "lib64", donor / "opt/python/lib", public / "openblas/0.3.28-gcc9.4.0/lib", cuda / "lib64"])),
-               CMAKE_PREFIX_PATH=str(public / "openblas/0.3.28-gcc9.4.0"),
-               LIBRARY_PATH=str(public / "openblas/0.3.28-gcc9.4.0/lib"),
-               CPATH=str(public / "openblas/0.3.28-gcc9.4.0/include"),
-               PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", UV_OFFLINE="1")
+    env.update(
+        CC=str(gcc / "bin/gcc"),
+        CXX=str(gcc / "bin/g++"),
+        FC=str(gcc / "bin/gfortran"),
+        LC_ALL="C",
+        LANG="C",
+        PYTHONNOUSERSITE="1",
+        OMP_NUM_THREADS="1",
+        OPENBLAS_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
+        CUDA_HOME=str(cuda),
+        CUDA_PATH=str(cuda),
+        CUDAToolkit_ROOT=str(cuda),
+        PATH=":".join(
+            map(
+                str,
+                [
+                    donor / "opt/git/bin",
+                    gcc / "bin",
+                    public / "cmake/3.29.6-gcc9.4.0/bin",
+                    cuda / "bin",
+                    Path("/usr/bin"),
+                    Path("/bin"),
+                ],
+            )
+        ),
+        LD_LIBRARY_PATH=":".join(
+            map(
+                str,
+                [
+                    gcc / "lib64",
+                    donor / "opt/python/lib",
+                    public / "openblas/0.3.28-gcc9.4.0/lib",
+                    cuda / "lib64",
+                ],
+            )
+        ),
+        CMAKE_PREFIX_PATH=str(public / "openblas/0.3.28-gcc9.4.0"),
+        LIBRARY_PATH=str(public / "openblas/0.3.28-gcc9.4.0/lib"),
+        CPATH=str(public / "openblas/0.3.28-gcc9.4.0/include"),
+        PIP_NO_INDEX="1",
+        PIP_DISABLE_PIP_VERSION_CHECK="1",
+        UV_OFFLINE="1",
+    )
     return env
 
 
@@ -147,9 +214,18 @@ def prepare(root, donor, profile):
     env = environment(root, donor)
     base = root / "opt/base"
     loader = base / "glibc-2.28/lib/ld-2.28.so"
-    command = [str(loader), "--library-path", ":".join(library_paths(root, profile)), str(base / "python-base/bin/python3")]
+    command = [
+        str(loader),
+        "--library-path",
+        ":".join(library_paths(root, profile)),
+        str(base / "python-base/bin/python3"),
+    ]
     if not (prefix / "pyvenv.cfg").exists():
-        subprocess.run([*command, "-m", "venv", "--copies", "--without-pip", str(prefix)], check=True, env=env)
+        subprocess.run(
+            [*command, "-m", "venv", "--copies", "--without-pip", str(prefix)],
+            check=True,
+            env=env,
+        )
     real = prefix / "bin/python3.real"
     if not real.exists():
         shutil.copy2(prefix / "bin/python3", real, follow_symlinks=True)
@@ -159,9 +235,33 @@ def prepare(root, donor, profile):
     with zipfile.ZipFile(source / "wheels" / pip["filename"]) as archive:
         archive.extractall(site)
     python = str(prefix / "bin/python")
-    find_links = [source / "wheels", donor / "src/wheels_symmetrix", root / "src/wheels"]
-    links = [part for path in find_links if path.exists() for part in ("--find-links", str(path))]
-    subprocess.run([python, "-m", "pip", "install", "--no-index", "--find-links", str(source / "wheels"), "--require-hashes", "-r", str(root / "deployment/requirements.lock.txt")], env=env, check=True)
+    find_links = [
+        source / "wheels",
+        donor / "src/wheels_symmetrix",
+        root / "src/wheels",
+    ]
+    links = [
+        part
+        for path in find_links
+        if path.exists()
+        for part in ("--find-links", str(path))
+    ]
+    subprocess.run(
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--find-links",
+            str(source / "wheels"),
+            "--require-hashes",
+            "-r",
+            str(root / "deployment/requirements.lock.txt"),
+        ],
+        env=env,
+        check=True,
+    )
     for asset in lock["sources"]:
         if asset["name"] == "glibc":
             continue
@@ -174,24 +274,65 @@ def prepare(root, donor, profile):
         if not tree.exists():
             with tarfile.open(archive) as bundle:
                 bundle.extractall(unpacked, filter="data")
-        subprocess.run([python, "-m", "pip", "install", "--no-index", "--no-deps", "--no-build-isolation", str(tree)], check=True, env=env)
+        subprocess.run(
+            [
+                python,
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--no-deps",
+                "--no-build-isolation",
+                str(tree),
+            ],
+            check=True,
+            env=env,
+        )
     # Reproduce the two already-qualified, API-only MACE/graph compatibility fixes.
-    patched = donor / "opt/polar" / RUNTIME_ID / "venv/lib/python3.12/site-packages/mace/modules/extensions.py"
+    patched = (
+        donor
+        / "opt/polar"
+        / RUNTIME_ID
+        / "venv/lib/python3.12/site-packages/mace/modules/extensions.py"
+    )
     destination = site / "mace/modules/extensions.py"
     before = sha256(destination)
     shutil.copy2(patched, destination)
-    subprocess.run([python, "-m", "pip", "install", "--no-index", *links,
-                    "scikit-build-core", "pybind11", "ninja", "pytest", "ruff"], check=True, env=env)
+    subprocess.run(
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            *links,
+            "scikit-build-core",
+            "pybind11",
+            "ninja",
+            "pytest",
+            "ruff",
+        ],
+        check=True,
+        env=env,
+    )
     install_wrappers(root, profile)
     subprocess.run([python, "-m", "pip", "check"], check=True, env=env)
-    write_json(root / "manifests" / ("runtime-" + profile + ".json"), {
-        "schema_version": 1, "profile": profile, "python": python,
-        "slurm_job_id": os.environ["SLURM_JOB_ID"],
-        "staging_sha256": sha256(root / "manifests/staging.json"),
-        "mace_compatibility": {"before_sha256": before, "after_sha256": sha256(destination),
-                               "qualified_donor_file": str(patched)},
-        "requirements_sha256": sha256(root / "deployment/requirements.lock.txt"),
-    })
+    write_json(
+        root / "manifests" / ("runtime-" + profile + ".json"),
+        {
+            "schema_version": 1,
+            "profile": profile,
+            "python": python,
+            "slurm_job_id": os.environ["SLURM_JOB_ID"],
+            "staging_sha256": sha256(root / "manifests/staging.json"),
+            "mace_compatibility": {
+                "before_sha256": before,
+                "after_sha256": sha256(destination),
+                "qualified_donor_file": str(patched),
+            },
+            "requirements_sha256": sha256(root / "deployment/requirements.lock.txt"),
+        },
+    )
 
 
 def main():

@@ -24,7 +24,9 @@ from ase.neighborlist import neighbor_list
 try:
     import torch
 except ImportError as error:
-    raise ImportError("SymmetrixPolar requires the symmetrix-xl[polar] extra") from error
+    raise ImportError(
+        "SymmetrixPolar requires the symmetrix-xl[polar] extra"
+    ) from error
 
 from . import load_backend
 from ._polar_compat import repair_polar_checkpoint
@@ -86,13 +88,15 @@ def _equilibrate(density, fukui, targets):
     return result
 
 
-def _suffix(model, features, positions, cell, node_attrs, edge_index, vectors, charge, spin):
+def _suffix(
+    model, features, positions, cell, node_attrs, edge_index, vectors, charge, spin
+):
     """Evaluate all energy readouts and charge updates using native leaf features."""
     from graph_longrange.kspace import compute_k_vectors_flat
     from mace.modules.utils import compute_total_charge_dipole_permuted
 
     count = positions.shape[0]
-    device, dtype = positions.device, positions.dtype
+    device = positions.device
     batch = torch.zeros(count, device=device, dtype=torch.long)
     node_heads = batch
     atom_index = torch.arange(count, device=device)
@@ -108,8 +112,8 @@ def _suffix(model, features, positions, cell, node_attrs, edge_index, vectors, c
     local_readouts = []
     density = positions.new_zeros((count, model.charges_irreps.dim))
     for layer, (feature, source) in enumerate(zip(features, model.lr_source_maps)):
-        readout_index = -1 if len(model.readouts) == 1 else min(
-            layer, len(model.readouts) - 1
+        readout_index = (
+            -1 if len(model.readouts) == 1 else min(layer, len(model.readouts) - 1)
         )
         local_readouts.append(
             model.readouts[readout_index](feature, node_heads)[atom_index, node_heads]
@@ -256,15 +260,32 @@ class SymmetrixPolar(Calculator):
     """
 
     implemented_properties = [
-        "energy", "free_energy", "forces", "charges", "dipole",
-        "density_coefficients", "spin_charge_density", "spins",
-        "electrostatic_energy", "electron_energy",
+        "energy",
+        "free_energy",
+        "forces",
+        "charges",
+        "dipole",
+        "density_coefficients",
+        "spin_charge_density",
+        "spins",
+        "electrostatic_energy",
+        "electron_energy",
     ]
 
     def __init__(
-        self, model, *, device="cpu", backend=None, bridge=None,
-        precision="float64", charge=None, spin=None, head=None,
-        diagnostics=True, profile=False, **kwargs,
+        self,
+        model,
+        *,
+        device="cpu",
+        backend=None,
+        bridge=None,
+        precision="float64",
+        charge=None,
+        spin=None,
+        head=None,
+        diagnostics=True,
+        profile=False,
+        **kwargs,
     ):
         super().__init__(**kwargs)
         if precision != "float64":
@@ -297,17 +318,23 @@ class SymmetrixPolar(Calculator):
         _validate_model(loaded)
         heads = getattr(loaded, "heads", ["Default"])
         if head is not None and head != heads[0]:
-            raise ValueError(f"Unknown Polar head {head!r}; available head is {heads[0]!r}")
+            raise ValueError(
+                f"Unknown Polar head {head!r}; available head is {heads[0]!r}"
+            )
         loaded = loaded.to(dtype=torch.float64).eval()
         self.checkpoint_compat = repair_polar_checkpoint(loaded, pbc_handling="pbc")
         from .extract_mace_nonlinear import extract_mace_nonlinear_data
 
         local_data = extract_mace_nonlinear_data(loaded)
-        self._artifact_directory = tempfile.TemporaryDirectory(prefix="symmetrix-polar-")
+        self._artifact_directory = tempfile.TemporaryDirectory(
+            prefix="symmetrix-polar-"
+        )
         artifact = Path(self._artifact_directory.name) / "local.json"
         artifact.write_text(json.dumps(local_data), encoding="utf-8")
         self.local_artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        requested_backend = "cpu" if backend is None and self.device.type == "cpu" else backend
+        requested_backend = (
+            "cpu" if backend is None and self.device.type == "cpu" else backend
+        )
         native = load_backend(requested_backend)
         self.native_execution_space = native._kokkos_default_execution_space()
         if self.device.type == "cuda" and self.native_execution_space != "Cuda":
@@ -316,7 +343,9 @@ class SymmetrixPolar(Calculator):
                 f"the selected native execution space is {self.native_execution_space!r}"
             )
         if self.device.type == "cpu" and self.native_execution_space not in (
-            "Serial", "OpenMP", "Threads"
+            "Serial",
+            "OpenMP",
+            "Threads",
         ):
             raise RuntimeError(
                 "CPU Polar inference requires a host Symmetrix backend; "
@@ -326,9 +355,13 @@ class SymmetrixPolar(Calculator):
             native._init_kokkos()
         self.evaluator = native.MACENonlinearKokkos(str(artifact), heads[0])
         if not callable(getattr(self.evaluator, "_forward_features", None)):
-            raise RuntimeError("The native backend lacks the Polar feature/VJP interface")
+            raise RuntimeError(
+                "The native backend lacks the Polar feature/VJP interface"
+            )
         self.native_build_info = (
-            native._backend_build_info() if hasattr(native, "_backend_build_info") else {}
+            native._backend_build_info()
+            if hasattr(native, "_backend_build_info")
+            else {}
         )
         self.native_device_ordinal = None
         if self.device.type == "cuda":
@@ -344,17 +377,30 @@ class SymmetrixPolar(Calculator):
         self.model = loaded.to(device=self.device, dtype=torch.float64).eval()
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
-        self.atomic_numbers = [int(value) for value in self.model.atomic_numbers.tolist()]
+        self.atomic_numbers = [
+            int(value) for value in self.model.atomic_numbers.tolist()
+        ]
         self.cutoff = float(self.model.r_max)
 
     def _polar_state(self, atoms):
         charge = float(atoms.info.get("charge", self.default_charge))
         spin = float(atoms.info.get("spin", self.default_spin))
-        field = np.asarray(atoms.info.get("external_field", [0.0, 0.0, 0.0]), dtype=float)
-        if not math.isfinite(charge) or not math.isfinite(spin) or spin < 1 or spin != int(spin):
-            raise ValueError("Polar requires finite charge and a positive integer spin multiplicity")
+        field = np.asarray(
+            atoms.info.get("external_field", [0.0, 0.0, 0.0]), dtype=float
+        )
+        if (
+            not math.isfinite(charge)
+            or not math.isfinite(spin)
+            or spin < 1
+            or spin != int(spin)
+        ):
+            raise ValueError(
+                "Polar requires finite charge and a positive integer spin multiplicity"
+            )
         if field.shape != (3,) or not np.isfinite(field).all() or np.any(field != 0):
-            raise ValueError("SymmetrixPolar currently supports zero external field only")
+            raise ValueError(
+                "SymmetrixPolar currently supports zero external field only"
+            )
         if not np.all(atoms.pbc) or abs(np.linalg.det(atoms.cell.array)) <= 1e-12:
             raise ValueError("SymmetrixPolar requires a nondegenerate full 3D PBC cell")
         return charge, spin
@@ -387,7 +433,9 @@ class SymmetrixPolar(Calculator):
         properties = ["energy", "forces"] if properties is None else properties
         unsupported = set(properties) - set(self.implemented_properties)
         if unsupported:
-            raise PropertyNotImplementedError(f"Unsupported Polar properties: {sorted(unsupported)}")
+            raise PropertyNotImplementedError(
+                f"Unsupported Polar properties: {sorted(unsupported)}"
+            )
         super().calculate(atoms, properties, system_changes)
         # A failed recalculation must not leave values from a previous geometry
         # beside ASE's newly copied atoms and make them look cached and valid.
@@ -398,103 +446,192 @@ class SymmetrixPolar(Calculator):
             raise ValueError("Polar requires at least one atom")
         unsupported_species = sorted(set(atoms.numbers) - set(self.atomic_numbers))
         if unsupported_species:
-            raise ValueError(f"Polar checkpoint does not support atomic numbers {unsupported_species}")
+            raise ValueError(
+                f"Polar checkpoint does not support atomic numbers {unsupported_species}"
+            )
         receiver, sender, shifts = neighbor_list("ijS", atoms, self.cutoff)
         order = np.argsort(receiver, kind="stable")
         receiver, sender, shifts = receiver[order], sender[order], shifts[order]
         # ASE D points receiver -> sender; MACE SH uses sender -> receiver.
-        vectors_np = atoms.positions[receiver] - atoms.positions[sender] - shifts @ atoms.cell.array
+        vectors_np = (
+            atoms.positions[receiver]
+            - atoms.positions[sender]
+            - shifts @ atoms.cell.array
+        )
         lengths_np = np.linalg.norm(vectors_np, axis=1)
         if np.any(lengths_np <= 0) or not np.isfinite(vectors_np).all():
             raise ValueError("Polar graph contains invalid edge vectors")
-        type_lookup = {number: index for index, number in enumerate(self.atomic_numbers)}
-        node_types = np.asarray([type_lookup[int(n)] for n in atoms.numbers], dtype=np.int32)
+        type_lookup = {
+            number: index for index, number in enumerate(self.atomic_numbers)
+        }
+        node_types = np.asarray(
+            [type_lookup[int(n)] for n in atoms.numbers], dtype=np.int32
+        )
         native_vectors = np.ascontiguousarray(vectors_np[:, [1, 2, 0]]).reshape(-1)
-        positions = torch.tensor(atoms.positions, device=self.device, dtype=torch.float64, requires_grad=True)
+        positions = torch.tensor(
+            atoms.positions, device=self.device, dtype=torch.float64, requires_grad=True
+        )
         cell = torch.tensor(atoms.cell.array, device=self.device, dtype=torch.float64)
-        edge_index = torch.tensor(np.stack([sender, receiver]), device=self.device, dtype=torch.long)
+        edge_index = torch.tensor(
+            np.stack([sender, receiver]), device=self.device, dtype=torch.long
+        )
         shift_tensor = torch.tensor(shifts, device=self.device, dtype=torch.float64)
-        vectors = positions[edge_index[1]] - positions[edge_index[0]] - shift_tensor @ cell
+        vectors = (
+            positions[edge_index[1]] - positions[edge_index[0]] - shift_tensor @ cell
+        )
         node_attrs = torch.nn.functional.one_hot(
-            torch.tensor(node_types, device=self.device, dtype=torch.long), len(self.atomic_numbers)
+            torch.tensor(node_types, device=self.device, dtype=torch.long),
+            len(self.atomic_numbers),
         ).to(torch.float64)
         mark("graph")
         token = self.evaluator._forward_features(
-            len(atoms), node_types, np.bincount(receiver, minlength=len(atoms)).astype(np.int32),
-            sender.astype(np.int32), node_types[sender], native_vectors,
+            len(atoms),
+            node_types,
+            np.bincount(receiver, minlength=len(atoms)).astype(np.int32),
+            sender.astype(np.int32),
+            node_types[sender],
+            native_vectors,
             np.ascontiguousarray(lengths_np),
         )
         mark("native_forward")
         if self.bridge == "dlpack":
-            features = [torch.utils.dlpack.from_dlpack(value) for value in self.evaluator._feature_tensors(token)]
+            features = [
+                torch.utils.dlpack.from_dlpack(value)
+                for value in self.evaluator._feature_tensors(token)
+            ]
             if any(value.device != self.device for value in features):
                 raise RuntimeError("Native and PyTorch Polar devices differ")
         else:
-            features = [torch.tensor(value, device=self.device, dtype=torch.float64) for value in self.evaluator._feature_arrays(token)]
+            features = [
+                torch.tensor(value, device=self.device, dtype=torch.float64)
+                for value in self.evaluator._feature_arrays(token)
+            ]
         features = [value.detach().requires_grad_(True) for value in features]
         mark("feature_export")
         with torch.enable_grad():
-            output = _suffix(self.model, features, positions, cell, node_attrs, edge_index, vectors, charge, spin)
+            output = _suffix(
+                self.model,
+                features,
+                positions,
+                cell,
+                node_attrs,
+                edge_index,
+                vectors,
+                charge,
+                spin,
+            )
             mark("torch_suffix_forward")
-            gradients = torch.autograd.grad(output["energy"], [*features, positions], allow_unused=True)
-        feature_gradients = [torch.zeros_like(value) if grad is None else grad.contiguous() for value, grad in zip(features, gradients[:-1])]
-        direct_force = torch.zeros_like(positions) if gradients[-1] is None else -gradients[-1]
+            gradients = torch.autograd.grad(
+                output["energy"], [*features, positions], allow_unused=True
+            )
+        feature_gradients = [
+            torch.zeros_like(value) if grad is None else grad.contiguous()
+            for value, grad in zip(features, gradients[:-1])
+        ]
+        direct_force = (
+            torch.zeros_like(positions) if gradients[-1] is None else -gradients[-1]
+        )
         mark("torch_autograd")
         if self.bridge == "dlpack":
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
-            self.evaluator._reverse_features(token, [torch.utils.dlpack.to_dlpack(value) for value in feature_gradients])
+            self.evaluator._reverse_features(
+                token,
+                [torch.utils.dlpack.to_dlpack(value) for value in feature_gradients],
+            )
             mark("native_vjp")
-            edge_force = torch.utils.dlpack.from_dlpack(self.evaluator._edge_force_tensor())
+            edge_force = torch.utils.dlpack.from_dlpack(
+                self.evaluator._edge_force_tensor()
+            )
             edge_force = edge_force[:, [2, 0, 1]]
         else:
-            self.evaluator._reverse_features_host(token, [value.detach().cpu().numpy() for value in feature_gradients])
+            self.evaluator._reverse_features_host(
+                token, [value.detach().cpu().numpy() for value in feature_gradients]
+            )
             mark("native_vjp")
-            edge_force = torch.tensor(np.asarray(self.evaluator.node_forces).reshape(-1, 3)[:, [2, 0, 1]], device=self.device, dtype=torch.float64)
+            edge_force = torch.tensor(
+                np.asarray(self.evaluator.node_forces).reshape(-1, 3)[:, [2, 0, 1]],
+                device=self.device,
+                dtype=torch.float64,
+            )
         forces = direct_force.clone()
         forces.index_add_(0, edge_index[1], edge_force)
         forces.index_add_(0, edge_index[0], -edge_force)
-        if not torch.isfinite(output["energy"]).all() or not torch.isfinite(forces).all():
+        if (
+            not torch.isfinite(output["energy"]).all()
+            or not torch.isfinite(forces).all()
+        ):
             raise FloatingPointError("Non-finite complete Polar energy or force")
         self.results = {
             "energy": float(output["energy"].detach().cpu()),
             "free_energy": float(output["energy"].detach().cpu()),
             "forces": forces.detach().cpu().numpy().copy(),
         }
-        for name in ("charges", "spins", "density_coefficients", "spin_charge_density", "dipole"):
+        for name in (
+            "charges",
+            "spins",
+            "density_coefficients",
+            "spin_charge_density",
+            "dipole",
+        ):
             self.results[name] = output[name].detach().cpu().numpy().copy()
         for name in ("electron_energy", "electrostatic_energy"):
             self.results[name] = float(output[name].detach().cpu())
-        totals = [value[:, :, 0].detach().sum(dim=0).cpu().tolist() for value in output["density_history"]]
+        totals = [
+            value[:, :, 0].detach().sum(dim=0).cpu().tolist()
+            for value in output["density_history"]
+        ]
         self.results["polar_diagnostics"] = {
-            "backbone": "native_feature_forward", "prefix_fallback": False,
-            "bridge": self.bridge, "precision": "float64",
+            "backbone": "native_feature_forward",
+            "prefix_fallback": False,
+            "bridge": self.bridge,
+            "precision": "float64",
             "bridge_semantics": (
                 "device_snapshot_and_d2d_seed_copy"
-                if self.bridge == "dlpack" else "host_snapshot_copy"
+                if self.bridge == "dlpack"
+                else "host_snapshot_copy"
             ),
             "feature_device": str(features[0].device),
-            "native_class": type(self.evaluator).__module__ + "." + type(self.evaluator).__name__,
+            "native_class": type(self.evaluator).__module__
+            + "."
+            + type(self.evaluator).__name__,
             "native_build_info": self.native_build_info,
             "native_execution_space": self.native_execution_space,
             "native_device_ordinal": self.native_device_ordinal,
             "checkpoint_sha256": self.checkpoint_sha256,
             "local_artifact_sha256": self.local_artifact_sha256,
             "checkpoint_compat": self.checkpoint_compat,
-            "num_interactions": len(features), "num_recursion_steps": len(output["potential_history"]),
+            "num_interactions": len(features),
+            "num_recursion_steps": len(output["potential_history"]),
             "feature_shapes": [list(value.shape) for value in features],
             "spherical_vector_permutation": [1, 2, 0],
-            "electrostatic_boundary": "pbc_k0_removed", "k_vectors_count": output["k_vectors_count"],
+            "electrostatic_boundary": "pbc_k0_removed",
+            "k_vectors_count": output["k_vectors_count"],
             "normalized_spin_charge_totals": totals,
             "total_charge": float(output["total_charge"].detach().sum().cpu()),
             "total_spin": float(output["spins"].detach().sum().cpu()),
-            "energy_terms": {name: float(output[key].detach().cpu()) for name, key in (
-                ("local", "local_energy"), ("electron", "electron_energy"),
-                ("electrostatic", "electrostatic_energy"), ("total", "energy"))},
+            "energy_terms": {
+                name: float(output[key].detach().cpu())
+                for name, key in (
+                    ("local", "local_energy"),
+                    ("electron", "electron_energy"),
+                    ("electrostatic", "electrostatic_energy"),
+                    ("total", "energy"),
+                )
+            },
         }
         if self.diagnostics_enabled:
-            self.results["polar_diagnostics"]["density_history"] = [value.detach().cpu().numpy().copy() for value in output["density_history"]]
-            self.results["polar_diagnostics"]["fukui_history"] = [value.detach().cpu().numpy().copy() for value in output["fukui_history"]]
+            self.results["polar_diagnostics"]["density_history"] = [
+                value.detach().cpu().numpy().copy()
+                for value in output["density_history"]
+            ]
+            self.results["polar_diagnostics"]["fukui_history"] = [
+                value.detach().cpu().numpy().copy() for value in output["fukui_history"]
+            ]
+            self.results["polar_diagnostics"]["potential_history"] = [
+                value.detach().cpu().numpy().copy()
+                for value in output["potential_history"]
+            ]
         self._last_polar_state = (charge, spin)
         mark("force_result_assembly")
         if self.profile:

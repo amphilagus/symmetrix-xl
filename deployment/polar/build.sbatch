@@ -11,6 +11,12 @@ root=$1
 donor=$2
 profile=${3:-cpu}
 export LC_ALL=C LANG=C
+if [[ "$profile" != cpu ]]; then
+    selected_gpu=$("$root/opt/$profile/bin/python" \
+        "$root/src/symmetrix-xl/deployment/polar/select_device.py" --profile "$profile")
+    export CUDA_VISIBLE_DEVICES="$selected_gpu"
+    nvidia-smi
+fi
 exec "$root/opt/$profile/bin/python" \
     "$root/src/symmetrix-xl/deployment/polar/build.py" \
     --root "$root" --donor "$donor" --profile "$profile" --jobs 6

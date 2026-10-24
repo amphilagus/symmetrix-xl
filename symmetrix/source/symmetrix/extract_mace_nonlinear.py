@@ -70,15 +70,24 @@ def _readout(readout) -> dict[str, Any]:
     }
 
 
+def _scale_shift(model) -> dict[str, Any]:
+    """Canonicalize a selected head's one-value buffers to native scalars."""
+    output = {}
+    for name in ("scale", "shift"):
+        value = getattr(model.scale_shift, name)
+        # MACE versions/checkpoints use either [] or [1] buffers. The native
+        # schema requires []; reshape a view without mutating the checkpoint.
+        # Preserve multi-value payloads for the existing prediction-head path.
+        output[name] = _tensor(value.reshape(()) if value.numel() == 1 else value)
+    return output
+
+
 def extract_mace_nonlinear_head_payload(model) -> dict[str, Any]:
     """Serialize only quantities selected by ``remove_pt_head``."""
 
     return {
         "atomic_energies": _tensor(model.atomic_energies_fn.atomic_energies),
-        "scale_shift": {
-            "scale": _tensor(model.scale_shift.scale),
-            "shift": _tensor(model.scale_shift.shift),
-        },
+        "scale_shift": _scale_shift(model),
         "readouts": [_readout(readout) for readout in model.readouts],
     }
 
@@ -351,10 +360,7 @@ def extract_mace_nonlinear_data(
         "l_max": int(model.spherical_harmonics._lmax),
         "num_interactions": len(model.interactions),
         "atomic_energies": _tensor(model.atomic_energies_fn.atomic_energies),
-        "scale_shift": {
-            "scale": _tensor(model.scale_shift.scale),
-            "shift": _tensor(model.scale_shift.shift),
-        },
+        "scale_shift": _scale_shift(model),
         "node_embedding": _linear(model.node_embedding.linear),
         "radial_embedding": {
             "apply_cutoff": bool(getattr(radial, "apply_cutoff", True)),

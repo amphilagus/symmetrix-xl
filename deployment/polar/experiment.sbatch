@@ -18,6 +18,9 @@ export SYMMETRIX_BACKEND=cpu
 device=cpu
 bridge=host
 if [[ "$profile" != cpu ]]; then
+    selected_gpu=$("$root/opt/$profile/bin/python" \
+        "$root/src/symmetrix-xl/deployment/polar/select_device.py" --profile "$profile")
+    export CUDA_VISIBLE_DEVICES="$selected_gpu"
     export SYMMETRIX_BACKEND="cuda12-$profile"
     device=cuda
     bridge=dlpack

@@ -26,7 +26,47 @@ import time
 import traceback
 from pathlib import Path
 
-import numpy as np
+
+def _early_execution_environment():
+    # Set affinity before NumPy, BLAS, PyTorch or Kokkos can create workers.
+    record = {"policy": "one logical CPU; its SMT siblings excluded"}
+    if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+        allowed = sorted(os.sched_getaffinity(0))
+        selected = allowed[0]
+        os.sched_setaffinity(0, {selected})
+        topology = Path(f"/sys/devices/system/cpu/cpu{selected}/topology")
+        record.update(
+            applied=True,
+            allowed_before=allowed,
+            selected_logical_cpu=selected,
+            allowed_after=sorted(os.sched_getaffinity(0)),
+            physical_topology={
+                name: (topology / name).read_text().strip()
+                if (topology / name).is_file()
+                else None
+                for name in ("physical_package_id", "core_id", "thread_siblings_list")
+            },
+        )
+    else:
+        record.update(
+            applied=False,
+            reason="OS lacks sched_setaffinity; not a qualified Linux CPU timing",
+        )
+    for name in (
+        "OMP_NUM_THREADS",
+        "KOKKOS_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[name] = "1"
+    return record
+
+
+EARLY_EXECUTION_ENVIRONMENT = _early_execution_environment()
+
+import numpy as np  # noqa: E402 -- pin CPU affinity before importing numerical runtimes
 
 ROOT = Path(__file__).resolve().parents[1]
 FORMAL_WATER_COUNTS = (64, 128, 256, 512)
@@ -160,6 +200,7 @@ def initial_box(waters, seed, density=1.0):
     atoms = apply_state(
         Atoms(numbers=numbers, positions=positions, cell=[length] * 3, pbc=True)
     )
+    atoms.set_array("water_id", np.concatenate(([-1], np.repeat(np.arange(waters), 3))))
     atoms.wrap()
     inspect_structure(atoms)
     return atoms
@@ -175,6 +216,44 @@ def velocities(atoms, temperature, seed):
         rng=np.random.default_rng(seed),
     )
     Stationary(atoms, preserve_temperature=True)
+
+
+def state_hashes(atoms):
+    """Hash the actual state arrays, including shape and a fixed byte order."""
+
+    def array_hash(values):
+        array = np.ascontiguousarray(values, dtype="<f8")
+        digest = hashlib.sha256(str(array.shape).encode() + array.tobytes())
+        return digest.hexdigest()
+
+    has_momenta = atoms.has("momenta")
+    return {
+        "positions_sha256": array_hash(atoms.positions),
+        "cell_sha256": array_hash(atoms.cell.array),
+        "velocities_sha256": array_hash(atoms.get_velocities())
+        if has_momenta
+        else None,
+        "momenta_sha256": array_hash(atoms.get_momenta()) if has_momenta else None,
+        "momenta_present": has_momenta,
+        "temperature_K": atoms.get_temperature() if has_momenta else None,
+        "hash_schema": "shape text followed by C-order little-endian float64 bytes; ASE native units",
+    }
+
+
+def preserve_or_initialize_velocities(atoms, temperature, seed):
+    if atoms.has("momenta"):
+        momenta = atoms.get_momenta()
+        if not np.isfinite(momenta).all():
+            raise ValueError("Prepared momenta contain non-finite values")
+        policy = {"policy": "preserve_prepared_momenta", "seed_used": None}
+    else:
+        velocities(atoms, temperature, seed)
+        policy = {
+            "policy": "deterministic_maxwell_fallback_when_momenta_absent",
+            "seed_used": seed,
+            "temperature_requested_K": temperature,
+        }
+    return policy | {"actual_state": state_hashes(atoms)}
 
 
 def make_calculator(args, executor, capture=False):
@@ -344,6 +423,7 @@ def provenance(args, calculator=None, executor=None):
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "pid": os.getpid(),
+        "early_execution_environment": EARLY_EXECUTION_ENVIRONMENT,
         "cpu_affinity": sorted(os.sched_getaffinity(0))
         if hasattr(os, "sched_getaffinity")
         else None,
@@ -457,6 +537,67 @@ def conserved_populations(result, tolerance=1e-9):
     }
 
 
+def regional_force_errors(atoms, delta, tolerance, shell_radius=3.2):
+    lithium = int(np.flatnonzero(atoms.numbers == 3)[0])
+    labels = atoms.arrays.get("water_id")
+    if labels is None:
+        # Files produced before water_id was added retain this preparation order.
+        water_atoms = np.flatnonzero(atoms.numbers != 3)
+        if len(water_atoms) % 3 or not np.all(
+            atoms.numbers[water_atoms].reshape(-1, 3) == [8, 1, 1]
+        ):
+            raise ValueError(
+                "Region analysis needs water_id labels or the prepared O,H,H molecule ordering"
+            )
+        labels = np.full(len(atoms), -1, dtype=int)
+        labels[water_atoms] = np.repeat(np.arange(len(water_atoms) // 3), 3)
+    labels = np.asarray(labels)
+    shell_ids, other_ids, oxygen_distances = [], [], {}
+    for identifier in sorted(set(labels[atoms.numbers != 3].tolist())):
+        members = np.flatnonzero(labels == identifier)
+        if len(members) != 3 or sorted(atoms.numbers[members].tolist()) != [1, 1, 8]:
+            raise ValueError(f"Invalid whole-water identity {identifier}")
+        oxygen = int(members[atoms.numbers[members] == 8][0])
+        distance = float(atoms.get_distance(lithium, oxygen, mic=True))
+        oxygen_distances[int(identifier)] = distance
+        (shell_ids if distance <= shell_radius else other_ids).append(identifier)
+    regions = {
+        "Li": (np.array([lithium]), []),
+        "hydration_shell_water": (
+            np.flatnonzero(np.isin(labels, shell_ids)),
+            shell_ids,
+        ),
+        "remaining_water": (np.flatnonzero(np.isin(labels, other_ids)), other_ids),
+    }
+    result = {}
+    for name, (indices, water_ids) in regions.items():
+        values = delta[indices]
+        maximum = float(np.max(np.abs(values))) if len(indices) else None
+        result[name] = {
+            "atom_count": len(indices),
+            "water_count": len(water_ids),
+            "atom_indices": indices,
+            "water_ids": water_ids,
+            "maximum_force_component_error_eV_A": maximum,
+            "maximum_force_vector_error_eV_A": float(
+                np.linalg.norm(values, axis=1).max()
+            )
+            if len(indices)
+            else None,
+            "rms_force_component_error_eV_A": float(np.sqrt(np.mean(values * values)))
+            if len(indices)
+            else None,
+            "passed": maximum is None or maximum <= tolerance,
+        }
+    result["definition"] = {
+        "shell_radius_A": shell_radius,
+        "oxygen_Li_distance": "minimum image",
+        "selection": "all three atoms of each water whose O is within radius",
+        "water_oxygen_distances_A": oxygen_distances,
+    }
+    return result
+
+
 def compare_results(original, candidate, atoms, args):
     delta = candidate["forces"] - original["forces"]
     lithium = int(np.flatnonzero(atoms.numbers == 3)[0])
@@ -479,6 +620,9 @@ def compare_results(original, candidate, atoms, args):
         "Li_force_original_eV_A": original["forces"][lithium],
         "Li_force_candidate_eV_A": candidate["forces"][lithium],
         "Li_force_vector_error_eV_A": float(np.linalg.norm(delta[lithium])),
+        "force_error_by_region": regional_force_errors(
+            atoms, delta, args.force_tolerance
+        ),
         "original_populations": original_conservation,
         "candidate_populations": candidate_conservation,
         "candidate_diagnostics": candidate["polar_diagnostics"],
@@ -577,6 +721,7 @@ def prepare(args):
                     }
                 atoms.calc = calculator
                 velocities(atoms, args.temperature, args.seed + waters)
+                nvt_initial_state = state_hashes(atoms)
                 dynamics = Langevin(
                     atoms,
                     args.timestep * units.fs,
@@ -589,13 +734,21 @@ def prepare(args):
                 )
                 dynamics.run(args.nvt_steps)
                 synchronize(args.device)
-                write(prefix.with_suffix(".equilibrated.extxyz"), atoms)
+                prepared_path = prefix.with_suffix(".equilibrated.extxyz")
+                final_state = state_hashes(atoms)
+                write(prepared_path, atoms)
                 manifest["nvt"] = {
                     "steps": args.nvt_steps,
                     "timestep_fs": args.timestep,
                     "temperature_target_K": args.temperature,
                     "final_temperature_K": atoms.get_temperature(),
                     "friction_fs_inverse": 0.01,
+                    "initial_state": nvt_initial_state,
+                    "final_state_in_memory": final_state,
+                    "prepared_output_state": state_hashes(
+                        load_structure(prepared_path)
+                    ),
+                    "prepared_output_sha256": sha256(prepared_path),
                 }
             manifest["status"] = "passed"
         except Exception as error:
@@ -667,7 +820,9 @@ def md(args):
         make_calculator(args, "original", True),
     )
     atoms.calc = candidate
-    velocities(atoms, args.temperature, args.seed)
+    velocity_initialization = preserve_or_initialize_velocities(
+        atoms, args.temperature, args.seed
+    )
     dynamics = VelocityVerlet(atoms, args.timestep * units.fs)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -677,6 +832,8 @@ def md(args):
         "same_trajectory_oracle": True,
         "structure": inspect_structure(atoms),
         "input_sha256": sha256(args.input),
+        "velocity_initialization": velocity_initialization,
+        "initial_state": state_hashes(atoms),
         "timestep_fs": args.timestep,
         "steps_requested": args.steps,
         "samples": [],
@@ -850,7 +1007,10 @@ def benchmark_worker(args):
     with MemoryMonitor(args.device) as memory:
         calculator = make_calculator(args, args.executor)
         atoms.calc = calculator
-        velocities(atoms, args.temperature, args.seed)
+        velocity_initialization = preserve_or_initialize_velocities(
+            atoms, args.temperature, args.seed
+        )
+        initial_state = state_hashes(atoms)
         dynamics = VelocityVerlet(atoms, args.timestep * units.fs)
         cutoff = float(
             calculator.model.r_max
@@ -904,6 +1064,8 @@ def benchmark_worker(args):
         "repeat": args.repeat,
         "structure": inspect_structure(atoms),
         "input_sha256": sha256(args.input),
+        "velocity_initialization": velocity_initialization,
+        "initial_state": initial_state,
         "provenance": info,
         "timing_scope": "complete ASE VelocityVerlet MD, including calculator and CPU force transfer; final CUDA synchronize included",
         "ensemble": "NVE",
@@ -1012,20 +1174,23 @@ def summarize_records(paths, output):
     ]
     if not records:
         raise ValueError("No benchmark_worker JSON records found")
-    identity = lambda record: (
-        record["input_sha256"],
-        record["provenance"]["checkpoint_sha256"],
-        record["structure"]["atoms"],
-        record["structure"]["waters"],
-        record["precision"],
-        record["timestep_fs"],
-        record["cutoff_A"],
-        tuple(record["properties"]),
-        record["block_seconds_requested"],
-        record["temperature_initial_K"],
-        record["warmup_steps_excluded"],
-        record["provenance"]["device_requested"],
-    )
+
+    def identity(record):
+        return (
+            record["input_sha256"],
+            record["provenance"]["checkpoint_sha256"],
+            record["structure"]["atoms"],
+            record["structure"]["waters"],
+            record["precision"],
+            record["timestep_fs"],
+            record["cutoff_A"],
+            tuple(record["properties"]),
+            record["block_seconds_requested"],
+            record["temperature_initial_K"],
+            record["warmup_steps_excluded"],
+            record["provenance"]["device_requested"],
+        )
+
     if len({identity(record) for record in records}) != 1:
         raise ValueError(
             "Reports mix different inputs/checkpoints/precision/timestep/cutoffs"
@@ -1077,6 +1242,19 @@ def summarize_records(paths, output):
         raise ValueError(
             "Original and candidate repeat identities or velocity seeds differ"
         )
+    for repeat in repeated_inputs["original"]:
+        paired = [record for record in records if record["repeat"] == repeat]
+        states = {
+            (
+                record["initial_state"]["positions_sha256"],
+                record["initial_state"]["velocities_sha256"],
+            )
+            for record in paired
+        }
+        if len(states) != 1:
+            raise ValueError(
+                f"Original and candidate initial positions or velocities differ in repeat {repeat}"
+            )
     summary["speedup_original_over_candidate"] = (
         original["median_us_per_atom_step"] / candidate["median_us_per_atom_step"]
     )

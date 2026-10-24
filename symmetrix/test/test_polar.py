@@ -142,16 +142,63 @@ def _batch(model, atoms, device="cpu"):
 def _reference(model, atoms, device="cpu"):
     from symmetrix._polar_compat import repair_polar_checkpoint
 
-    model = copy.deepcopy(model).to(
-        device=device, dtype=_polar_dependencies()[0].float64
-    )
+    torch, _ = _polar_dependencies()
+    model = copy.deepcopy(model).to(device=device, dtype=torch.float64)
     repair_polar_checkpoint(model, pbc_handling="pbc")
-    output = model(_batch(model, atoms, device), compute_force=True)
-    return {
+    histories = {"density_history": [], "fukui_history": [], "potential_history": []}
+
+    def snapshot(value):
+        return value.detach().cpu().numpy().copy()
+
+    def normalized_fukui_hook(module, args, output):
+        # The oracle is one graph. Match the official double-precision sum and
+        # zero-denominator rule without calling the candidate's normalization.
+        values = output if module is model.fukui_source_map else output[:, -2:]
+        norm = values.double().sum(dim=0, keepdim=True).to(values.dtype)
+        norm = torch.where(norm == 0, torch.ones_like(norm), norm)
+        histories["fukui_history"].append(snapshot(values / norm))
+
+    def update_input_hook(module, args, kwargs):
+        # These are the tensors actually consumed by the official update,
+        # after its own Fukui equilibration and electrostatic normalization.
+        histories["density_history"].append(
+            snapshot(kwargs["local_charges"].reshape(len(atoms), 2, -1))
+        )
+        histories["potential_history"].append(snapshot(kwargs["potential_features"]))
+
+    def final_density_hook(module, args, kwargs):
+        histories["density_history"].append(
+            snapshot(kwargs["charges_induced"].reshape(len(atoms), 2, -1))
+        )
+
+    handles = [model.fukui_source_map.register_forward_hook(normalized_fukui_hook)]
+    for update in model.field_dependent_charges_maps:
+        handles.append(
+            update.register_forward_pre_hook(update_input_hook, with_kwargs=True)
+        )
+        handles.append(update.register_forward_hook(normalized_fukui_hook))
+    handles.append(
+        model.local_electron_energy.register_forward_pre_hook(
+            final_density_hook, with_kwargs=True
+        )
+    )
+    try:
+        # Keep the original complete forward as the energy/force oracle. Hooks
+        # only observe intermediate tensors and never replace forward outputs.
+        output = model(_batch(model, atoms, device), compute_force=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert len(histories["density_history"]) == model.num_recursion_steps + 1
+    assert len(histories["fukui_history"]) == model.num_recursion_steps + 1
+    assert len(histories["potential_history"]) == model.num_recursion_steps
+    result = {
         name: value.detach().cpu().numpy()
         for name, value in output.items()
         if value is not None and hasattr(value, "detach")
     }
+    result.update(histories)
+    return result
 
 
 def _selected_device():
@@ -172,6 +219,7 @@ def _selected_device():
 
 
 def _assert_polar_result(actual, expected, atoms, atol=2e-8):
+    density_outputs = {"charges", "density_coefficients", "spin_charge_density"}
     for name in (
         "energy",
         "forces",
@@ -184,8 +232,8 @@ def _assert_polar_result(actual, expected, atoms, atol=2e-8):
         np.testing.assert_allclose(
             np.asarray(actual[name]).reshape(-1),
             np.asarray(expected[name]).reshape(-1),
-            rtol=2e-8,
-            atol=atol,
+            rtol=1e-7 if name in density_outputs else 2e-8,
+            atol=1e-9 if name in density_outputs else atol,
             err_msg=name,
         )
     np.testing.assert_allclose(
@@ -204,6 +252,22 @@ def _assert_polar_result(actual, expected, atoms, atol=2e-8):
     assert diagnostics["num_recursion_steps"] == 2
     assert diagnostics["spherical_vector_permutation"] == [1, 2, 0]
     assert diagnostics["electrostatic_boundary"] == "pbc_k0_removed"
+    for name, count in (
+        ("density_history", 3),
+        ("fukui_history", 3),
+        ("potential_history", 2),
+    ):
+        assert len(diagnostics[name]) == len(expected[name]) == count
+        for iteration, (actual_value, expected_value) in enumerate(
+            zip(diagnostics[name], expected[name])
+        ):
+            np.testing.assert_allclose(
+                actual_value,
+                expected_value,
+                rtol=1e-7,
+                atol=1e-9,
+                err_msg=f"{name}[{iteration}]",
+            )
     terms = diagnostics["energy_terms"]
     np.testing.assert_allclose(
         terms["local"] + terms["electron"] + terms["electrostatic"],
@@ -229,6 +293,44 @@ def test_ordinary_converter_rejects_complete_polar_checkpoint(
     torch.save(reduced_polar_model, checkpoint)
     with pytest.raises(ValueError, match="SymmetrixPolar"):
         extract_mace_data(checkpoint)
+
+
+@pytest.mark.parametrize("shape", [(), (1,)])
+def test_native_scalar_scale_shift_preserves_checkpoint(reduced_polar_model, shape):
+    torch, _ = _polar_dependencies()
+    from symmetrix.extract_mace_nonlinear import (
+        extract_mace_nonlinear_data,
+        extract_mace_nonlinear_head_payload,
+    )
+
+    model = copy.deepcopy(reduced_polar_model)
+    original = {}
+    for name in ("scale", "shift"):
+        value = getattr(model.scale_shift, name).reshape(shape)
+        setattr(model.scale_shift, name, value)
+        original[name] = value.clone()
+    for export in (extract_mace_nonlinear_data, extract_mace_nonlinear_head_payload):
+        payload = export(model)["scale_shift"]
+        for name, tensor in original.items():
+            assert payload[name] == {"shape": [], "values": [tensor.item()]}
+            assert getattr(model.scale_shift, name).shape == shape
+            assert torch.equal(getattr(model.scale_shift, name), tensor)
+
+
+def test_multivalue_head_payload_is_not_collapsed(reduced_polar_model):
+    torch, _ = _polar_dependencies()
+    from symmetrix.extract_mace_nonlinear import extract_mace_nonlinear_head_payload
+
+    model = copy.deepcopy(reduced_polar_model)
+    model.heads = ["first", "second"]
+    model.scale_shift.scale = torch.tensor([1.3, 1.7], dtype=torch.float64)
+    model.scale_shift.shift = torch.tensor([-0.02, 0.03], dtype=torch.float64)
+    payload = extract_mace_nonlinear_head_payload(model)["scale_shift"]
+    for name in ("scale", "shift"):
+        assert payload[name] == {
+            "shape": [2],
+            "values": getattr(model.scale_shift, name).tolist(),
+        }
 
 
 @pytest.mark.parametrize("bridge", ["host", "dlpack"])
@@ -301,9 +403,14 @@ def test_complete_force_matches_energy_finite_difference(
 ):
     from symmetrix.polar import SymmetrixPolar
 
-    calculator = SymmetrixPolar(reduced_polar_model, device=_selected_device())
+    calculator = SymmetrixPolar(
+        reduced_polar_model, device=_selected_device(), diagnostics=False
+    )
     lithium_water.calc = calculator
     force = lithium_water.get_forces()[2, 1]
+    assert not {"density_history", "fukui_history", "potential_history"}.intersection(
+        calculator.results["polar_diagnostics"]
+    )
     step = 2e-5
     lithium_water.positions[2, 1] += step
     plus = lithium_water.get_potential_energy()

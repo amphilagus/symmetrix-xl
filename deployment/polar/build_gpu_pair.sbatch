@@ -5,15 +5,15 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:3
 #SBATCH --mem=160G
 #SBATCH --time=06:00:00
 set -euo pipefail
 root=$1
 donor=$2
 source_root="$root/src/symmetrix-xl"
-# This node has untyped GPU GRES. Reserve the four-device allocation, then each
-# child selects its matching architecture only within that allocation.
+# This node has two GPUs of each architecture and untyped GRES. Any allocation
+# of three contains both; children select only inside that allocation.
 bash "$source_root/deployment/polar/build.sbatch" "$root" "$donor" sm80 \
     > "$root/logs/build-sm80-$SLURM_JOB_ID.log" 2>&1 &
 sm80_pid=$!

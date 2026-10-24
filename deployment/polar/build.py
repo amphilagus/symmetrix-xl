@@ -42,7 +42,8 @@ def main():
     install_wrappers(root, profile)
     env["PATH"] = str(python.parent) + os.pathsep + env["PATH"]
     env["UV_CACHE_DIR"] = str(root / "build/cache" / profile / "uv")
-    env["UV_FIND_LINKS"] = env["PIP_FIND_LINKS"]
+    # uv treats this environment value as one location, unlike pip's list.
+    env["UV_FIND_LINKS"] = str(root / "src/wheels")
     env["UV_PYTHON_DOWNLOADS"] = "never"
     subprocess.run(
         [str(python), "-m", "pip", "install", "--no-index", "uv==0.8.22"],
@@ -159,6 +160,9 @@ def main():
         subprocess.run(command, cwd=source, env=env, check=True)
     env.pop("SYMMETRIX_POLAR_BUILD_MODE", None)
     env["SYMMETRIX_BACKEND"] = "cpu" if profile == "cpu" else "cuda12-" + profile
+    env["SYMMETRIX_POLAR_MODEL"] = str(
+        root / "forcefields/polar1s/MACE-POLAR-1-S.model"
+    )
     for label, command in (
         (
             "version",

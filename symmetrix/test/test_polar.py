@@ -118,25 +118,32 @@ def _batch(model, atoms, device="cpu"):
             "external_field": "external_field",
         }
     )
-    config = data.config_from_atoms(
-        atoms, key_specification=keys, head_name=model.heads[0]
+    # AtomicData constructs tensors using Torch's default dtype. Casting a graph
+    # built in FP32 to FP64 cannot recover the original ASE geometry.
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        config = data.config_from_atoms(
+            atoms, key_specification=keys, head_name=model.heads[0]
+        )
+        graph = data.AtomicData.from_config(
+            config,
+            z_table=utils.AtomicNumberTable([int(z) for z in model.atomic_numbers]),
+            cutoff=float(model.r_max),
+            heads=model.heads,
+        )
+        loader = torch_geometric.dataloader.DataLoader(
+            dataset=[graph], batch_size=1, shuffle=False, drop_last=False
+        )
+        batch = next(iter(loader)).to(device).to_dict()
+    finally:
+        torch.set_default_dtype(old_dtype)
+    assert batch["positions"].dtype == batch["cell"].dtype == torch.float64
+    np.testing.assert_array_equal(batch["positions"].cpu().numpy(), atoms.positions)
+    np.testing.assert_array_equal(
+        batch["cell"].reshape(3, 3).cpu().numpy(), atoms.cell.array
     )
-    graph = data.AtomicData.from_config(
-        config,
-        z_table=utils.AtomicNumberTable([int(z) for z in model.atomic_numbers]),
-        cutoff=float(model.r_max),
-        heads=model.heads,
-    )
-    loader = torch_geometric.dataloader.DataLoader(
-        dataset=[graph], batch_size=1, shuffle=False, drop_last=False
-    )
-    batch = next(iter(loader)).to(device).to_dict()
-    return {
-        key: value.to(dtype=torch.float64)
-        if torch.is_tensor(value) and value.is_floating_point()
-        else value
-        for key, value in batch.items()
-    }
+    return batch
 
 
 def _reference(model, atoms, device="cpu"):
@@ -317,6 +324,28 @@ def test_native_scalar_scale_shift_preserves_checkpoint(reduced_polar_model, sha
             assert torch.equal(getattr(model.scale_shift, name), tensor)
 
 
+@pytest.mark.parametrize("shape", [(3,), (3, 1), (1, 3)])
+def test_native_atomic_energy_layout_preserves_checkpoint(reduced_polar_model, shape):
+    torch, _ = _polar_dependencies()
+    from symmetrix.extract_mace_nonlinear import (
+        extract_mace_nonlinear_data,
+        extract_mace_nonlinear_head_payload,
+    )
+
+    model = copy.deepcopy(reduced_polar_model)
+    model.atomic_energies_fn.atomic_energies = (
+        model.atomic_energies_fn.atomic_energies.reshape(shape)
+    )
+    original = model.atomic_energies_fn.atomic_energies.clone()
+    for export in (extract_mace_nonlinear_data, extract_mace_nonlinear_head_payload):
+        assert export(model)["atomic_energies"] == {
+            "shape": [1, 3],
+            "values": original.reshape(-1).tolist(),
+        }
+        assert model.atomic_energies_fn.atomic_energies.shape == shape
+        assert torch.equal(model.atomic_energies_fn.atomic_energies, original)
+
+
 def test_multivalue_head_payload_is_not_collapsed(reduced_polar_model):
     torch, _ = _polar_dependencies()
     from symmetrix.extract_mace_nonlinear import extract_mace_nonlinear_head_payload
@@ -325,7 +354,15 @@ def test_multivalue_head_payload_is_not_collapsed(reduced_polar_model):
     model.heads = ["first", "second"]
     model.scale_shift.scale = torch.tensor([1.3, 1.7], dtype=torch.float64)
     model.scale_shift.shift = torch.tensor([-0.02, 0.03], dtype=torch.float64)
-    payload = extract_mace_nonlinear_head_payload(model)["scale_shift"]
+    energies = torch.tensor([[0.2, -0.4, 0.1], [0.3, 0.5, -0.1]], dtype=torch.float64)
+    model.atomic_energies_fn.atomic_energies = energies
+    head_payload = extract_mace_nonlinear_head_payload(model)
+    assert head_payload["atomic_energies"] == {
+        "shape": [2, 3],
+        "values": energies.reshape(-1).tolist(),
+    }
+    assert torch.equal(model.atomic_energies_fn.atomic_energies, energies)
+    payload = head_payload["scale_shift"]
     for name in ("scale", "shift"):
         assert payload[name] == {
             "shape": [2],

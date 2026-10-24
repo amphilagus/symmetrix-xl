@@ -82,11 +82,23 @@ def _scale_shift(model) -> dict[str, Any]:
     return output
 
 
+def _atomic_energies(model) -> dict[str, Any]:
+    """Canonicalize equivalent single-head E0 layouts without changing weights."""
+    value = model.atomic_energies_fn.atomic_energies
+    if len(getattr(model, "heads", [])) <= 1 and value.numel() == len(
+        model.atomic_numbers
+    ):
+        # Native JSON uses [head, species]; whole-model checkpoints also use
+        # [species] or [species, 1] for a single head. Preserve species order.
+        value = value.reshape(1, -1)
+    return _tensor(value)
+
+
 def extract_mace_nonlinear_head_payload(model) -> dict[str, Any]:
     """Serialize only quantities selected by ``remove_pt_head``."""
 
     return {
-        "atomic_energies": _tensor(model.atomic_energies_fn.atomic_energies),
+        "atomic_energies": _atomic_energies(model),
         "scale_shift": _scale_shift(model),
         "readouts": [_readout(readout) for readout in model.readouts],
     }
@@ -359,7 +371,7 @@ def extract_mace_nonlinear_data(
         "r_cut": float(model.r_max),
         "l_max": int(model.spherical_harmonics._lmax),
         "num_interactions": len(model.interactions),
-        "atomic_energies": _tensor(model.atomic_energies_fn.atomic_energies),
+        "atomic_energies": _atomic_energies(model),
         "scale_shift": _scale_shift(model),
         "node_embedding": _linear(model.node_embedding.linear),
         "radial_embedding": {

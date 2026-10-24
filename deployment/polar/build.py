@@ -277,6 +277,7 @@ def main():
             "-q",
             "symmetrix/test/test_polar.py",
             "symmetrix/test/test_polar_features.py",
+            "symmetrix/test/test_polar_local_regression.py",
             "--junitxml=" + str(manifest / "polar-tests.xml"),
         ],
         cwd=source,

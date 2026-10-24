@@ -9,6 +9,7 @@ outside every Git checkout, including the deployed source checkout.
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -698,6 +699,10 @@ def identities(evidence):
         "tensor_inventory_sha256",
         "positions_sha256",
         "velocities_sha256",
+        "initial_positions_sha256",
+        "input_sha256",
+        "script_sha256",
+        "source_git_sha",
     }
     rows = []
 
@@ -735,6 +740,161 @@ def identities(evidence):
             if identity not in seen:
                 rows.append((source, name, value))
                 seen.add(identity)
+    return rows
+
+
+def nsys_statistics(path):
+    """Read concatenated Nsight CSV summaries without combining time domains."""
+    reports = {"api": [], "memory_time": [], "memory_size": []}
+    header, kind = None, None
+    for row in csv.reader(path.read_text(errors="replace").splitlines()):
+        if "Name" in row and "Total Time (ns)" in row:
+            header, kind = row, "api"
+        elif "Operation" in row and "Total Time (ns)" in row:
+            header, kind = row, "memory_time"
+        elif "Operation" in row and "Total (MB)" in row:
+            header, kind = row, "memory_size"
+        elif header and len(row) == len(header):
+            reports[kind].append(dict(zip(header, row, strict=True)))
+        else:
+            header, kind = None, None
+    return reports
+
+
+def module_diagnostics(evidence):
+    summaries, modules, stages, memory, synchronizations = ([] for _ in range(5))
+    directory = evidence.root / "benchmark/module-profile"
+    for path in sorted(directory.glob("*/*-modules.json")):
+        if path.name.endswith("-traced-modules.json"):
+            continue
+        data, error = evidence.read(path)
+        label = f"{path.stem.removesuffix('-modules')}/{path.parent.name}"
+        if not data:
+            summaries.append((label, f"失败：{error}", *(["未提供"] * 9), link(path)))
+            continue
+        calls = data.get("calls", [])
+        summary = data.get("summary", {})
+
+        def interval(record):
+            return " / ".join(
+                fmt(record.get(key)) for key in ("median", "minimum", "maximum")
+            )
+
+        parities = [row.get("instrumentation_parity", {}) for row in calls]
+        parities.append(data.get("restored_instrumentation_parity", {}))
+        summaries.append(
+            (
+                label,
+                LABELS[explicit_status(data)],
+                data.get("atoms", "未提供"),
+                data.get("diagnostic_calls", "未提供"),
+                data.get("precision", "未提供"),
+                interval(summary.get("long_range_electrostatic_forward_ms", {})),
+                interval(summary.get("whole_suffix_autograd_ms", {})),
+                fmt(summary.get("stage_timings_ms", {}).get("total", {}).get("median")),
+                fmt(maximum(parities, "energy_max_abs_eV")),
+                fmt(maximum(parities, "force_max_abs_eV_A")),
+                data.get("bridge", "未提供"),
+                link(path),
+            )
+        )
+        for name, record in summary.get("forward_regions", {}).items():
+            counts = sorted(
+                {
+                    row.get("forward_regions", {}).get(name, {}).get("calls")
+                    for row in calls
+                    if number(row.get("forward_regions", {}).get(name, {}).get("calls"))
+                }
+            )
+            modules.append(
+                (
+                    label,
+                    name,
+                    str(counts),
+                    interval(record.get("inclusive_ms", {})),
+                    interval(record.get("exclusive_ms", {})),
+                )
+            )
+        for name, record in summary.get("stage_timings_ms", {}).items():
+            stages.append((label, name, interval(record)))
+        prefix = path.name.removesuffix("-modules.json")
+        traced, _ = evidence.read(path.with_name(f"{prefix}-traced-modules.json"))
+        trace_status = (
+            LABELS[explicit_status(traced)]
+            + "; cudaProfilerRange="
+            + str((traced or {}).get("cuda_profiler_range", {}).get("requested"))
+        )
+        statistics_path = path.with_name(f"{prefix}-cuda-statistics.txt")
+        for artifact in (
+            statistics_path,
+            path.with_name(f"{prefix}-normal-call.nsys-rep"),
+            path.with_name(f"{prefix}-normal-call.sqlite"),
+            path.parent / "nsys-version.txt",
+        ):
+            if artifact.is_file():
+                evidence.file_inventory[str(artifact)] = file_hash(artifact)
+        if not statistics_path.is_file():
+            continue
+        reports = nsys_statistics(statistics_path)
+        sizes = {row["Operation"]: row for row in reports["memory_size"]}
+        for row in reports["memory_time"]:
+            memory.append(
+                (
+                    label,
+                    row["Operation"],
+                    row["Count"],
+                    fmt(float(row["Total Time (ns)"]) / 1e6),
+                    sizes.get(row["Operation"], {}).get("Total (MB)", "未提供"),
+                    trace_status,
+                    link(statistics_path),
+                )
+            )
+        for row in reports["api"]:
+            if "Synchronize" in row["Name"]:
+                synchronizations.append(
+                    (
+                        label,
+                        row["Name"],
+                        row["Num Calls"],
+                        fmt(float(row["Total Time (ns)"]) / 1e6),
+                        fmt(float(row["Avg (ns)"]) / 1e3),
+                        link(statistics_path),
+                    )
+                )
+    return summaries, modules, stages, memory, synchronizations
+
+
+def pipeline_records(evidence):
+    rows = []
+    paths = sorted((evidence.root / "benchmark/gpu-pair").glob("*/pipeline.json"))
+    paths.extend(
+        sorted((evidence.root / "manifests/qualification").glob("*/pipeline.json"))
+    )
+    for path in paths:
+        data, error = evidence.read(path)
+        records = [(path, data, error)]
+        for profile in (data or {}).get("profiles", {}):
+            child_path = path.with_name(f"{profile}-pipeline.json")
+            child, child_error = evidence.read(child_path)
+            records.append((child_path, child, child_error))
+        for record_path, record, record_error in records:
+            record = record or {}
+            stages = record.get("stages", [])
+            completed = sum(
+                row.get("status") == "passed" and row.get("returncode") == 0
+                for row in stages
+            )
+            rows.append(
+                (
+                    f"{record.get('profile', 'controller')}/{path.parent.name}",
+                    "失败" if record_error else LABELS[explicit_status(record)],
+                    f"{completed}/{len(stages)}" if stages else "—",
+                    record_error
+                    or "; ".join(str(row.get("output", "未提供")) for row in stages)
+                    or str(record.get("profiles", "未提供")),
+                    link(record_path) if record_path.is_file() else "未提供",
+                )
+            )
     return rows
 
 
@@ -1166,6 +1326,10 @@ def render(root):
                         "单独同步诊断调用；不计入 throughput",
                     )
                 )
+    module_rows, module_region_rows, module_stage_rows, copy_rows, sync_rows = (
+        module_diagnostics(evidence)
+    )
+    pipeline_rows = pipeline_records(evidence)
     counts = {status: sum(row[0] == status for row in checks) for status in LABELS}
     lines = [
         "# MACE-POLAR 适配资格报告",
@@ -1251,6 +1415,17 @@ def render(root):
                 "证据",
             ],
             diagnostic_rows,
+        ),
+        (
+            "实际流水线完成范围",
+            [
+                "profile/job",
+                "完成标记",
+                "通过 stage / 已记录 stage",
+                "实际输出范围",
+                "证据",
+            ],
+            pipeline_rows,
         ),
         (
             "共同准备态",
@@ -1348,6 +1523,58 @@ def render(root):
             profile_rows,
         ),
         (
+            "独立模块诊断（与正式吞吐量分开）",
+            [
+                "profile/job",
+                "状态",
+                "atoms",
+                "调用数",
+                "精度",
+                "选定长程 forward ms（median/min/max）",
+                "整个 Torch autograd ms（median/min/max）",
+                "插桩总阶段 median ms",
+                "max |ΔE| eV",
+                "max |ΔFcomp| eV/Å",
+                "bridge",
+                "证据",
+            ],
+            module_rows,
+        ),
+        (
+            "模块 forward 明细（每次计算内多次调用取合计）",
+            [
+                "profile/job",
+                "模块",
+                "每次计算实际调用数",
+                "inclusive ms（median/min/max）",
+                "exclusive ms（median/min/max）",
+            ],
+            module_region_rows,
+        ),
+        (
+            "同一模块插桩调用的整体阶段",
+            ["profile/job", "阶段", "ms（median/min/max）"],
+            module_stage_rows,
+        ),
+        (
+            "Nsight 无 hooks 正常单次调用：GPU 内存操作",
+            [
+                "profile/job",
+                "GPU 操作",
+                "次数",
+                "GPU activity 总 ms",
+                "总 MB（Nsight 单位）",
+                "配套调用状态",
+                "证据",
+            ],
+            copy_rows,
+        ),
+        (
+            "Nsight 同次调用：主机同步 API 持续时间",
+            ["profile/job", "API", "次数", "主机 API 总 ms", "平均 µs", "证据"],
+            sync_rows,
+        ),
+        (
             "内存证据",
             [
                 "profile",
@@ -1417,6 +1644,14 @@ def render(root):
             "正式物理阈值：总胞能量误差 ≤ 1e-4 eV，最大力分量误差 ≤ 1e-5 eV/Å，初始及两轮更新后的 |Q−1| ≤ 1e-9 e、|spin population| ≤ 1e-9。水合壳按 O–Li 最小镜像距离 ≤ 3.2 Å 选取整分子。NVE 目标为 0.25 fs、100/1000 步；漂移仅报告实际数值，没有自创漂移阈值。正式性能为 FP64、原模型/候选各 3 次独立进程、每块至少 10 秒。",
             "",
             "MD 可以单独记录不同的 CPU 线程策略；其实际 affinity、线程环境和已提供的 native concurrency 单列。轨迹运行时间不替代严格单核的正式 benchmark，缺少实际并行计数时不从环境变量推断已使用多少工作线程。",
+            "",
+            "流水线 passed 只覆盖其实际 stage 输出。例如四尺寸 validation/benchmark 与一个尺寸 MD 的流水线，不证明其余尺寸也完成 MD；物理对照表仍逐尺寸判断。模块诊断自动发现 benchmark/module-profile/<job>/<profile>-modules.json，包括后续 CPU 记录；没有插桩前后 E/F 一致性记录时不推断一致。",
+            "",
+            "模块计时包含 Python/hooks 和逐区域 GPU 同步开销，不属于正式吞吐量。选定长程 forward 为 descriptor geometry、两次更新×两 spin 的四次 dynamic field 以及 Coulomb energy；场更新 MLP、局部电子能、局部 readout 分列。倒空间枚举、归一化及模块外的平衡步骤仍在其余 suffix 中。整个 Torch autograd 包含所有后缀导数，未独立测出长程 backward。各项中位数分别计算，不能要求其相加严格等于总中位数。",
+            "",
+            "feature_export 包含 native 特征快照复制与同步，DLPack 接口目前不是零复制；native_vjp 包含 adjoint 导入/复制、桥接同步与局部反向。native_vjp 之后的力快照导出、坐标还原/归约和最终主机传输归 force_result_assembly；graph 和 native_forward 还各含图张量传输、输入 staging。",
+            "",
+            "Nsight 仅捕获另一次 profile=False、无模块 hooks 的正常计算及末尾完成同步。GPU memcpy/memset 是设备 activity；同步 API 是主机调用持续时间，其中包含等待 GPU kernels/复制完成的时间，两者可能重叠，不能相加，也不能把 API 持续时间称为独立的纯同步开销。全调用的 D2D 含 Torch/native 内部缓冲复制，不能全部归为特征桥接。带 Unified 标签的迁移保留为独立项。trace、SQLite、统计文本及 JSON 的 SHA-256 保存在证据清单。",
             "",
             "跳过的测试没有被当作已验证能力。原模型/候选速度只取已有汇总，区域最大值与阶段中位数由实际记录计算。NVIDIA own PID 数值包含 Torch/native 分配；Torch-only 不代表进程显存。all-GPU 数据含其他进程，不能当作模型独占显存。未提供的计数或数值保持缺失，没有填零。",
             "",

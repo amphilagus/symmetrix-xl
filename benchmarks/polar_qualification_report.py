@@ -237,7 +237,7 @@ def preparation_status(data, error, waters):
     if data.get("structure", {}).get("waters") != waters:
         return "FAILED", "准备记录的实际 water 数不匹配"
     if not data.get("optimization", {}).get("converged"):
-        return "PENDING", "尚无 BFGS 收敛证据；仅初始构型不计完整准备"
+        return "PENDING", "尚无优化收敛证据；仅初始构型不计完整准备"
     optimization = data["optimization"]
     if (
         not number(optimization.get("maximum_force_eV_A"))
@@ -566,6 +566,7 @@ def render(root):
             (
                 waters,
                 LABELS[status],
+                optimization.get("optimizer_class", "未提供"),
                 fmt(optimization.get("steps")),
                 fmt(optimization.get("maximum_force_eV_A")),
                 fmt(nvt.get("steps")),
@@ -799,7 +800,8 @@ def render(root):
             [
                 "waters",
                 "状态",
-                "BFGS steps",
+                "实际 optimizer class",
+                "optimizer steps",
                 "最终 fmax eV/Å",
                 "NVT steps",
                 "最终 K",

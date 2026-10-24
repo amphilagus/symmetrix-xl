@@ -14,10 +14,10 @@ donor=$2
 source_root="$root/src/symmetrix-xl"
 # This node has two GPUs of each architecture and untyped GRES. Any allocation
 # of three contains both; children select only inside that allocation.
-bash "$source_root/deployment/polar/build.sbatch" "$root" "$donor" sm80 \
+bash "$source_root/deployment/polar/build.sbatch" "$root" "$donor" sm80 "${@:3}" \
     > "$root/logs/build-sm80-$SLURM_JOB_ID.log" 2>&1 &
 sm80_pid=$!
-bash "$source_root/deployment/polar/build.sbatch" "$root" "$donor" sm90 \
+bash "$source_root/deployment/polar/build.sbatch" "$root" "$donor" sm90 "${@:3}" \
     > "$root/logs/build-sm90-$SLURM_JOB_ID.log" 2>&1 &
 sm90_pid=$!
 status=0

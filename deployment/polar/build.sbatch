@@ -19,4 +19,4 @@ if [[ "$profile" != cpu ]]; then
 fi
 exec "$root/opt/$profile/bin/python" \
     "$root/src/symmetrix-xl/deployment/polar/build.py" \
-    --root "$root" --donor "$donor" --profile "$profile" --jobs 6
+    --root "$root" --donor "$donor" --profile "$profile" --jobs 6 "${@:4}"

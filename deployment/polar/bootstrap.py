@@ -109,6 +109,7 @@ def library_paths(root, profile):
         str(base / "gcc-runtime/lib64"),
         str(base / "python-base/lib"),
         str(root.parent / "opt/openblas/0.3.28-gcc9.4.0/lib"),
+        str(root / "opt" / profile / "lib/polar-cuda-loader-links"),
         str(site / "torch/lib"),
         *native,
         "/usr/lib64",
@@ -116,8 +117,51 @@ def library_paths(root, profile):
     ]
 
 
+def install_cuda_loader_links(root, profile):
+    """Resolve dlopen's unversioned names only against this locked profile."""
+    prefix = root / "opt" / profile
+    site = prefix / "lib/python3.12/site-packages"
+    directory = prefix / "lib/polar-cuda-loader-links"
+    directory.mkdir(parents=True, exist_ok=True)
+    inventory = {}
+    for alias, component, filename in (
+        ("libcudart.so", "cuda_runtime", "libcudart.so.12"),
+        ("libnvrtc.so", "cuda_nvrtc", "libnvrtc.so.12"),
+        ("libnvJitLink.so", "nvjitlink", "libnvJitLink.so.12"),
+    ):
+        target = site / "nvidia" / component / "lib" / filename
+        link = directory / alias
+        if link.exists() and not link.is_symlink():
+            raise FileExistsError(
+                f"Refusing to replace non-symlink CUDA loader alias: {link}"
+            )
+        if not target.is_file():
+            # An optional wheel may be absent during initial environment
+            # creation. Never retain a stale alias to another environment.
+            if link.is_symlink():
+                link.unlink()
+            continue
+        resolved = target.resolve(strict=True)
+        if not resolved.is_relative_to(prefix.resolve()):
+            raise RuntimeError(f"CUDA loader target escapes its own profile: {target}")
+        relative = os.path.relpath(target, directory)
+        if link.is_symlink() and os.readlink(link) != relative:
+            link.unlink()
+        if not link.is_symlink():
+            link.symlink_to(relative)
+        inventory[alias] = {
+            "path": str(link),
+            "link_target": relative,
+            "source": str(target),
+            "resolved_source": str(resolved),
+            "source_sha256": sha256(resolved),
+        }
+    return inventory
+
+
 def install_wrappers(root, profile):
     prefix = root / "opt" / profile
+    cuda_loader_links = install_cuda_loader_links(root, profile)
     loader = root / "opt/base/glibc-2.28/lib/ld-2.28.so"
     script = "#!/bin/bash\nset -euo pipefail\n"
     script += "unset PYTHONHOME PYTHONPATH LD_PRELOAD LD_AUDIT\n"
@@ -149,6 +193,7 @@ def install_wrappers(root, profile):
     (site / "sitecustomize.py").write_text(
         "import sys\n" + "sys.executable = " + repr(str(prefix / "bin/python")) + "\n"
     )
+    return cuda_loader_links
 
 
 def environment(root, donor):
@@ -315,7 +360,7 @@ def prepare(root, donor, profile):
         check=True,
         env=env,
     )
-    install_wrappers(root, profile)
+    cuda_loader_links = install_wrappers(root, profile)
     subprocess.run([python, "-m", "pip", "check"], check=True, env=env)
     write_json(
         root / "manifests" / ("runtime-" + profile + ".json"),
@@ -331,6 +376,7 @@ def prepare(root, donor, profile):
                 "qualified_donor_file": str(patched),
             },
             "requirements_sha256": sha256(root / "deployment/requirements.lock.txt"),
+            "cuda_loader_links": cuda_loader_links,
         },
     )
 

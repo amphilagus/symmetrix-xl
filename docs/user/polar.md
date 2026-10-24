@@ -144,9 +144,14 @@ The reproducible driver is `benchmarks/polar_li_water.py`. Each prepared box
 contains exactly one Li and 64, 128, 256, or 512 complete waters, with total
 charge +1, spin multiplicity one, zero external field, full PBC, and water
 density 1 g/cm³. Larger boxes are independently constructed; a charged box is
-never repeated. Preparation uses fixed seeds, fixed-cell original-model FP64
-BFGS with at most 2000 steps and `fmax=0.05 eV/Å`, followed by 500 NVT steps
+never repeated. Preparation uses fixed seeds and fixed-cell original-model FP64
+optimization with at most 2000 steps and `fmax=0.05 eV/Å`, followed by 500 NVT steps
 at 300 K and 0.25 fs. Failure to converge is recorded and stops preparation.
+`--optimizer auto` uses LBFGS for at least 256 waters and BFGS for smaller boxes;
+`--optimizer bfgs` and `--optimizer lbfgs` select either method explicitly. The
+manifest records the actual optimizer class, and its log/trajectory suffix is
+`.bfgs` or `.lbfgs`. Resuming with `--input` preserves the convergence criterion
+and cell; changing optimizer does not imply a new thermodynamic state.
 
 The deployed `deployment/polar/experiment.sbatch` wrapper takes the deployment
 root, runtime profile (`cpu`, `sm80`, or `sm90`), then a driver subcommand. It

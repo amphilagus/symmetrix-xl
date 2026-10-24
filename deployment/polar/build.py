@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 
 from bootstrap import environment, install_wrappers, sha256, write_json
 
@@ -18,6 +19,11 @@ def main():
     parser.add_argument("--donor", type=Path, required=True)
     parser.add_argument("--profile", choices=("cpu", "sm80", "sm90"), required=True)
     parser.add_argument("--jobs", type=int, default=6)
+    parser.add_argument(
+        "--qualify-only",
+        action="store_true",
+        help="Reuse installed binaries only when both source fingerprints match",
+    )
     args = parser.parse_args()
     if not os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("Native compilation requires a Slurm compute job")
@@ -39,7 +45,7 @@ def main():
     )
     env["CMAKE_ARGS"] = "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
     python = root / "opt" / profile / "bin/python"
-    install_wrappers(root, profile)
+    loader_links = install_wrappers(root, profile)
     env["PATH"] = str(python.parent) + os.pathsep + env["PATH"]
     env["UV_CACHE_DIR"] = str(root / "build/cache" / profile / "uv")
     # uv treats this environment value as one location, unlike pip's list.
@@ -54,6 +60,12 @@ def main():
     wheels.mkdir(exist_ok=True)
     manifest = root / "manifests/build" / profile
     manifest.mkdir(parents=True, exist_ok=True)
+    previous = [p for p in manifest.iterdir() if p.is_file()]
+    if previous:
+        archive = manifest / "attempts" / ("before-" + os.environ["SLURM_JOB_ID"])
+        archive.mkdir(parents=True, exist_ok=False)
+        for path in previous:
+            shutil.copy2(path, archive / path.name)
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=source, env=env, text=True
     ).strip()
@@ -74,7 +86,9 @@ def main():
         str(args.jobs),
     ]
     frontend = [str(python), "tools/symmetrix_build.py"]
-    if profile == "cpu":
+    if args.qualify_only:
+        pass
+    elif profile == "cpu":
         command = [
             *frontend,
             "wheel",
@@ -203,11 +217,22 @@ def main():
                     text=True,
                 )
             )
+            compiled_commit = compiled.get("source_commit")
+            if args.qualify_only:
+                if descriptor.get("source_commit") != compiled_commit:
+                    raise RuntimeError(
+                        "Installed binary and descriptor revisions differ"
+                    )
+                subprocess.run(
+                    ["git", "cat-file", "-e", compiled_commit + "^{commit}"],
+                    cwd=source,
+                    env=env,
+                    check=True,
+                )
             for identity in (descriptor, compiled):
                 if (
-                    identity.get("source_commit") != commit
-                    or identity.get("source_dirty") is not False
-                ):
+                    not args.qualify_only and identity.get("source_commit") != commit
+                ) or identity.get("source_dirty") is not False:
                     raise RuntimeError(
                         "Native probe source revision differs from the clean checkout"
                     )
@@ -233,7 +258,9 @@ def main():
     write_json(
         manifest / "built.json",
         {
-            "source_commit": commit,
+            "source_commit": compiled_commit,
+            "qualification_source_commit": commit,
+            "qualification_only": args.qualify_only,
             "profile": profile,
             "python": str(python),
             "slurm_job_id": os.environ["SLURM_JOB_ID"],
@@ -242,6 +269,7 @@ def main():
             ),
             "wheel_sha256": {p.name: sha256(p) for p in wheels.glob("*.whl")},
             "python_wrapper_sha256": sha256(python),
+            "cuda_loader_links": loader_links,
             "version_probe_sha256": sha256(manifest / "version.json"),
             "extension_path": str(probe["extension"]),
             "extension_sha256": sha256(probe["extension"]),

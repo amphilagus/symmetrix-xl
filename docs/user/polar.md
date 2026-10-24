@@ -78,11 +78,20 @@ only its MACE-like submodules would discard long-range terms.
 
 `bridge="host"` exports feature snapshots as NumPy arrays and stages adjoints
 back into the native evaluator. It is useful for CPU execution and debugging.
-`bridge="dlpack"` transfers device-owned feature and adjoint tensors through
-DLPack, and keeps the CUDA force reduction on the device. Snapshots own their
+`bridge="dlpack"` exports device-owned feature snapshots and copies adjoint
+seeds between device allocations through DLPack. It keeps CUDA force reduction
+on the device. This is a device snapshot and device-to-device copy bridge.
+Snapshots own their
 storage; they do not alias a later native calculation. The current bridge uses
 explicit synchronization when exchanging tensors between Kokkos and PyTorch.
 It does not establish a zero-overhead or asynchronous execution guarantee.
+
+For one diagnostic call, `profile=True` adds synchronized stage timings in
+`results["polar_diagnostics"]["timings_ms"]`. It separates graph construction,
+native feature evaluation/export, the PyTorch suffix and autograd, native VJP,
+and force/result assembly. Throughput measurements must keep `profile=False`,
+which is the default; synchronized diagnostic calls are separate from timing
+samples.
 
 The native prefix currently uses materialized nonlinear execution. It does not
 claim the prepared direct, generated R1, or fixed-workspace performance of

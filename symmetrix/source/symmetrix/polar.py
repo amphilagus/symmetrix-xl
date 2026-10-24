@@ -248,7 +248,8 @@ class SymmetrixPolar(Calculator):
     currently supported. Stress, FP32, other boundary conditions, training and
     multi-GPU inference are intentionally rejected.
 
-    ``bridge='host'`` copies features through host memory for debugging;
+    ``bridge=None`` (or ``'auto'``) selects DLPack on CUDA and host copies on
+    CPU. ``bridge='host'`` copies features through host memory for debugging;
     ``'dlpack'`` uses device snapshots and device-to-device adjoint copies;
     it is not a zero-copy bridge. ``profile=True`` measures synchronized stage
     times for a diagnostic call. Keep profiling disabled for throughput runs.
@@ -261,15 +262,13 @@ class SymmetrixPolar(Calculator):
     ]
 
     def __init__(
-        self, model, *, device="cpu", backend=None, bridge="host",
+        self, model, *, device="cpu", backend=None, bridge=None,
         precision="float64", charge=None, spin=None, head=None,
         diagnostics=True, profile=False, **kwargs,
     ):
         super().__init__(**kwargs)
         if precision != "float64":
             raise ValueError("SymmetrixPolar currently supports float64 only")
-        if bridge not in ("host", "dlpack"):
-            raise ValueError("Polar bridge must be 'host' or 'dlpack'")
         self.device = torch.device(device)
         if self.device.type not in ("cpu", "cuda"):
             raise ValueError("SymmetrixPolar supports CPU or a single CUDA device")
@@ -278,6 +277,10 @@ class SymmetrixPolar(Calculator):
                 raise RuntimeError("CUDA was requested but PyTorch cannot access CUDA")
             if self.device.index is None:
                 self.device = torch.device("cuda", torch.cuda.current_device())
+        if bridge is None or bridge == "auto":
+            bridge = "dlpack" if self.device.type == "cuda" else "host"
+        if bridge not in ("host", "dlpack"):
+            raise ValueError("Polar bridge must be 'auto', 'host', or 'dlpack'")
         self.bridge = bridge
         self.default_charge = 0.0 if charge is None else float(charge)
         self.default_spin = 1.0 if spin is None else float(spin)
@@ -304,7 +307,21 @@ class SymmetrixPolar(Calculator):
         artifact = Path(self._artifact_directory.name) / "local.json"
         artifact.write_text(json.dumps(local_data), encoding="utf-8")
         self.local_artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        native = load_backend(backend)
+        requested_backend = "cpu" if backend is None and self.device.type == "cpu" else backend
+        native = load_backend(requested_backend)
+        self.native_execution_space = native._kokkos_default_execution_space()
+        if self.device.type == "cuda" and self.native_execution_space != "Cuda":
+            raise RuntimeError(
+                "CUDA Polar inference requires a CUDA Symmetrix backend; "
+                f"the selected native execution space is {self.native_execution_space!r}"
+            )
+        if self.device.type == "cpu" and self.native_execution_space not in (
+            "Serial", "OpenMP", "Threads"
+        ):
+            raise RuntimeError(
+                "CPU Polar inference requires a host Symmetrix backend; "
+                f"the selected native execution space is {self.native_execution_space!r}"
+            )
         if not native._kokkos_is_initialized():
             native._init_kokkos()
         self.evaluator = native.MACENonlinearKokkos(str(artifact), heads[0])
@@ -313,10 +330,17 @@ class SymmetrixPolar(Calculator):
         self.native_build_info = (
             native._backend_build_info() if hasattr(native, "_backend_build_info") else {}
         )
-        self.native_execution_space = (
-            native._kokkos_default_execution_space()
-            if hasattr(native, "_kokkos_default_execution_space") else "unknown"
-        )
+        self.native_device_ordinal = None
+        if self.device.type == "cuda":
+            environment = self.evaluator.device_cuda_environment
+            if environment.get("available") is not True:
+                raise RuntimeError("The native Polar CUDA device is unavailable")
+            self.native_device_ordinal = int(environment["device_ordinal"])
+            if self.native_device_ordinal != self.device.index:
+                raise RuntimeError(
+                    "Native and PyTorch CUDA device ordinals differ: "
+                    f"{self.native_device_ordinal} != {self.device.index}"
+                )
         self.model = loaded.to(device=self.device, dtype=torch.float64).eval()
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
@@ -453,6 +477,7 @@ class SymmetrixPolar(Calculator):
             "native_class": type(self.evaluator).__module__ + "." + type(self.evaluator).__name__,
             "native_build_info": self.native_build_info,
             "native_execution_space": self.native_execution_space,
+            "native_device_ordinal": self.native_device_ordinal,
             "checkpoint_sha256": self.checkpoint_sha256,
             "local_artifact_sha256": self.local_artifact_sha256,
             "checkpoint_compat": self.checkpoint_compat,

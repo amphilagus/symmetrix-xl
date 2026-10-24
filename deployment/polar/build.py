@@ -37,8 +37,8 @@ def main():
     wheels.mkdir(exist_ok=True)
     manifest = root / "manifests/build" / profile
     manifest.mkdir(parents=True, exist_ok=True)
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
-    dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=source, text=True)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, env=env, text=True).strip()
+    dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=source, env=env, text=True)
     if dirty:
         raise RuntimeError("Native build source has tracked modifications")
     common = ["--generator", "Unix Makefiles", "--build-root", str(root / "build/native" / profile), "--jobs", str(args.jobs)]

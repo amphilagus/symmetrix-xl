@@ -343,6 +343,57 @@ def test_float32_request_is_rejected(reduced_polar_model):
         SymmetrixPolar(reduced_polar_model, precision="float32")
 
 
+def test_profiled_call_preserves_physics_and_reports_stages(
+    reduced_polar_model, lithium_water
+):
+    from symmetrix.polar import SymmetrixPolar
+
+    device = _selected_device()
+    expected = _reference(reduced_polar_model, lithium_water, device)
+    calculator = SymmetrixPolar(reduced_polar_model, device=device, profile=True)
+    calculator.calculate(lithium_water, properties=["energy", "forces"])
+    _assert_polar_result(calculator.results, expected, lithium_water)
+    timings = calculator.results["polar_diagnostics"]["timings_ms"]
+    assert set(timings) == {
+        "graph",
+        "native_forward",
+        "feature_export",
+        "torch_suffix_forward",
+        "torch_autograd",
+        "native_vjp",
+        "force_result_assembly",
+        "total",
+    }
+    assert all(np.isfinite(value) and value >= 0 for value in timings.values())
+    accounted = sum(value for name, value in timings.items() if name != "total")
+    assert accounted <= timings["total"] * 1.05 + 1.0
+
+
+def test_failed_calculation_cannot_reuse_old_geometry_results(
+    reduced_polar_model, lithium_water, monkeypatch
+):
+    import symmetrix.polar as polar_module
+
+    calculator = polar_module.SymmetrixPolar(
+        reduced_polar_model, device=_selected_device()
+    )
+    lithium_water.calc = calculator
+    lithium_water.get_potential_energy()
+    lithium_water.positions[2] += [0.02, -0.01, 0.03]
+
+    def fail_suffix(*args, **kwargs):
+        raise RuntimeError("deliberate suffix failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(polar_module, "_suffix", fail_suffix)
+        with pytest.raises(RuntimeError, match="deliberate suffix failure"):
+            lithium_water.get_potential_energy()
+    assert calculator.results == {}
+    lithium_water.get_potential_energy()
+    expected = _reference(reduced_polar_model, lithium_water, _selected_device())
+    _assert_polar_result(calculator.results, expected, lithium_water)
+
+
 def test_real_h512_s_checkpoint_oracle(lithium_water):
     """Opt in explicitly; this test never downloads the foundation checkpoint."""
     checkpoint = os.environ.get("SYMMETRIX_POLAR_MODEL")

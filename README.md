@@ -11,6 +11,15 @@ and extends it with scalable, low-latency native execution paths for CPUs and
 GPUs. The Python distribution is named `symmetrix-xl`; the import namespace and
 command-line interface remain `symmetrix`.
 
+This fork's `codex/mace-polar` branch adds an experimental FP64
+`SymmetrixPolar` ASE calculator for MACE-POLAR-1-S. The nonlinear local backbone
+and its feature-gradient reverse pass run natively; official Torch modules
+retain the complete readouts and long-range energy. See the
+[POLAR interface and qualification guide](docs/user/polar.md) for the fixed-cell,
+three-dimensional periodic scope, optional dependencies, and reproducible CPU,
+A100 and H100 workflows. This path has independent correctness and performance
+qualification.
+
 The methods, validation, and benchmark protocol are described in the preprint
 [Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models](https://arxiv.org/abs/2610.01036).
 

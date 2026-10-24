@@ -18,7 +18,9 @@ import statistics
 import xml.etree.ElementTree as ET
 
 
-PROFILES = ("cpu", "sm80", "sm90")
+PROFILES = ("cpu-omp", "sm80", "sm90")
+DIAGNOSTIC_PROFILES = ("cpu",)
+UPSTREAM_COMMIT = "aee9f980eb48bbee125a500a28fa6517466a1b66"
 WATERS = (64, 128, 256, 512)
 LABELS = {"PASSED": "通过", "PENDING": "待完成", "FAILED": "失败"}
 
@@ -66,6 +68,7 @@ class Evidence:
         self.records = []
         self.file_inventory = {}
         self.superseded_failures = []
+        self.historical_tests = []
 
     def read(self, path, *, version=False):
         if not path.is_file():
@@ -254,6 +257,39 @@ def preparation_status(data, error, waters):
     return "PASSED", "原模型固定晶胞优化收敛，NVT 完成"
 
 
+def junit_details(evidence, path):
+    evidence.file_inventory[str(path)] = file_hash(path)
+    try:
+        tree = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as error:
+        return None, str(error)
+    cases = list(tree.iter("testcase"))
+    counts = {
+        "passed": sum(
+            all(case.find(tag) is None for tag in ("failure", "error", "skipped"))
+            for case in cases
+        ),
+        "failed": sum(case.find("failure") is not None for case in cases),
+        "errors": sum(case.find("error") is not None for case in cases),
+        "skipped": sum(case.find("skipped") is not None for case in cases),
+        "tests": len(cases),
+    }
+    status = (
+        "FAILED"
+        if counts["failed"] or counts["errors"]
+        else ("PASSED" if counts["passed"] else "PENDING")
+    )
+    return {"status": status, "counts": counts, "cases": cases}, None
+
+
+def junit_note(details):
+    counts = details["counts"]
+    return (
+        f"{counts['passed']} passed / {counts['failed']} failed / "
+        f"{counts['errors']} error / {counts['skipped']} skipped"
+    )
+
+
 def junit(evidence, profile):
     roots = (
         evidence.root / "tests",
@@ -263,33 +299,33 @@ def junit(evidence, profile):
     paths = set()
     for base in roots:
         if base.is_dir():
-            for path in base.rglob("*.xml"):
-                if (
-                    base.name == profile
-                    or profile in path.parts
-                    or profile in path.name
-                ):
-                    paths.add(path)
+            if base.name == profile:
+                paths.update(base.rglob("*.xml"))
+            else:
+                for path in base.glob("*.xml"):
+                    if profile in path.name and not (
+                        profile == "cpu" and "cpu-omp" in path.name
+                    ):
+                        paths.add(path)
+                tagged = base / profile
+                if tagged.is_dir():
+                    paths.update(tagged.rglob("*.xml"))
     rows = []
     for path in sorted(paths):
-        evidence.file_inventory[str(path)] = file_hash(path)
-        try:
-            tree = ET.parse(path).getroot()
-        except (ET.ParseError, OSError) as error:
-            rows.append(("FAILED", path, str(error), None))
+        details, error = junit_details(evidence, path)
+        if error:
+            rows.append(("FAILED", path, error, None))
             continue
-        cases = list(tree.iter("testcase"))
+        cases = details["cases"]
         if not cases:
             rows.append(("PENDING", path, "无 testcase；不推断测试已通过", None))
             continue
-        failed = sum(case.find("failure") is not None for case in cases)
-        errors = sum(case.find("error") is not None for case in cases)
-        skipped = sum(case.find("skipped") is not None for case in cases)
-        status = (
-            "FAILED"
-            if failed or errors
-            else ("PASSED" if len(cases) > skipped else "PENDING")
-        )
+        status = details["status"]
+        if "attempts" in path.parts:
+            evidence.historical_tests.append(
+                (profile, path, status, junit_note(details))
+            )
+            continue
         real = [
             case
             for case in cases
@@ -310,15 +346,229 @@ def junit(evidence, profile):
                     else "通过"
                 )
             )
+        prefix_note = ""
+        for case in cases:
+            for prop in case.findall("./properties/property"):
+                if prop.get("name") != "real_h512_s_native_feature_vjp_oracle":
+                    continue
+                try:
+                    oracle = json.loads(prop.get("value", ""))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(oracle, dict):
+                    evidence.records.append((path, oracle))
+                    prefix_note = "；独立前缀/VJP：" + ", ".join(
+                        f"{row.get('label')} maxabs={fmt(row.get('max_abs'))}, 容差比={fmt(row.get('max_normalized_ratio'))}"
+                        for row in oracle.get("comparisons", [])
+                    )
         rows.append(
             (
                 status,
                 path,
-                f"{len(cases) - failed - errors - skipped} passed / {failed} failed / {errors} error / {skipped} skipped；真实 h512 S：{real_status}",
+                junit_note(details) + f"；真实 h512 S：{real_status}" + prefix_note,
                 len(cases),
             )
         )
     return rows
+
+
+def cpu_runtime(evidence, profile):
+    directory = evidence.root / "manifests/build" / profile
+    path, data, error = evidence.first(
+        [
+            directory / "doctor-torch-polar.json",
+            evidence.root / f"tests/{profile}-doctor-torch-polar.json",
+        ]
+    )
+    if error:
+        return "FAILED", path, None, error
+    if data is None:
+        return "PENDING", path, None, "未找到实际 Torch/POLAR 栈的严格 doctor"
+    report = data.get("diagnostics", data.get("cli_doctor", data))
+    runtime = report.get("runtime", {})
+    context = report.get("qualification_context", {})
+    libraries = runtime.get("loaded_openmp_libraries", [])
+    qualified = (
+        report.get("status") == "ok"
+        and report.get("ok") is True
+        and report.get("strict") is True
+        and runtime.get("kokkos_initialized") is True
+        and runtime.get("kokkos_concurrency") == 1
+        and runtime.get("worker_sentinel", {}).get("actual_team_size") == 1
+        and len(libraries) == 1
+        and context.get("executor", {}).get("calculator") == "SymmetrixPolar"
+        and number(context.get("energy_eV"))
+        and number(context.get("maximum_force_eV_A"))
+    )
+    issues = [
+        row.get("message", row.get("name", ""))
+        for row in report.get("checks", [])
+        if row.get("status") in ("error", "warning")
+    ]
+    note = (
+        "实际 Torch/POLAR 栈严格 doctor 为 ok，且仅加载一个 OpenMP runtime"
+        if qualified
+        else f"strict doctor={report.get('status', '未提供')}；"
+        + ("；".join(issues) or "缺少已初始化、单运行库的完整通过证据")
+    )
+    return "PASSED" if qualified else "FAILED", path, report, note
+
+
+def build_identity_status(profile, built, version, version_path):
+    if not built or not version:
+        return "PENDING", "构建或 probe 记录缺失"
+    if version.get("probe_status") != "ok":
+        return "FAILED", "native probe 未通过"
+    if built.get("profile") != profile or not built.get("source_commit"):
+        return "FAILED", "构建 profile 或源提交记录不完整"
+    probe = version.get("probe", {})
+    expected_selector = "cpu" if profile.startswith("cpu") else "cuda12-" + profile
+    if probe.get("backend", {}).get("selector") != expected_selector:
+        return "FAILED", "native selector 与配置不匹配"
+    for identity in (probe.get("backend", {}), probe.get("build_info", {})):
+        if (
+            identity.get("source_commit") != built["source_commit"]
+            or identity.get("source_dirty") is not False
+        ):
+            return "FAILED", "构建与 probe 的干净源提交不匹配"
+        for key in ("source_content_sha256", "native_source_content_sha256"):
+            digest = built.get("source_fingerprints", {}).get(key)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or identity.get(key) != digest
+            ):
+                return "FAILED", "构建与 probe 的源指纹不匹配：" + key
+    if built.get("version_probe_sha256") != file_hash(version_path):
+        return "FAILED", "built.json 记录的 probe 文件哈希不匹配"
+    if len(built.get("extension_sha256", "")) != 64:
+        return "FAILED", "缺少扩展二进制哈希"
+    device = probe.get("device_environment", {})
+    if profile.startswith("sm") and (
+        device.get("available") is not True
+        or device.get("device_memory") is not True
+        or device.get("execution_space") != "Cuda"
+        or device.get("compute_capability_code") != int(profile[2:])
+    ):
+        return "FAILED", "实际 CUDA 设备与目标架构不匹配"
+    return "PASSED", "干净源提交、源指纹、probe 文件哈希和目标设备记录一致"
+
+
+def full_cpu_regression(evidence):
+    path = evidence.root / "tests/cpu-full.xml"
+    if not path.is_file():
+        return [], [], [("PENDING", "完整 CPU 回归", "未找到 cpu-full.xml")]
+    details, error = junit_details(evidence, path)
+    if error:
+        return [], [], [("FAILED", "完整 CPU 回归", error)]
+    overview = [("cpu（历史锁定运行环境）", junit_note(details), link(path))]
+    checks = [(details["status"], "完整 CPU 回归原始结果", junit_note(details))]
+    baseline_dir = evidence.root / "tests/upstream-aee9f980"
+    baseline_path, baseline, baseline_error = evidence.first(
+        [baseline_dir / "baseline.json"]
+    )
+    baseline_xml = baseline_dir / "four-mh1-tests.xml"
+    original, original_error = (
+        junit_details(evidence, baseline_xml)
+        if baseline_xml.is_file()
+        else (None, None)
+    )
+    legacy_path, legacy, legacy_error = evidence.first(
+        [evidence.root / "tests/full-cpu-9890071/legacy-environment.json"]
+    )
+    candidate_failures = {
+        case.get("name"): case.find("failure").get("message", "")
+        for case in details["cases"]
+        if case.find("failure") is not None
+    }
+    original_failures = {
+        case.get("name"): case.find("failure").get("message", "")
+        for case in (original or {}).get("cases", [])
+        if case.find("failure") is not None
+    }
+    reproduced = set()
+    if (
+        not baseline_error
+        and not original_error
+        and baseline
+        and baseline.get("source_commit") == UPSTREAM_COMMIT
+        and baseline.get("source_pristine") is True
+        and len(original_failures) == 4
+        and all(
+            candidate_failures.get(name) == message
+            for name, message in original_failures.items()
+        )
+    ):
+        reproduced = set(original_failures)
+    groups = {}
+    for name, message in candidate_failures.items():
+        reason = "尚未归因"
+        if name in reproduced:
+            reason = "干净上游独立构建复现同一 MH1 失败及打印误差指标"
+        elif (
+            name.startswith("test_initial_state_")
+            or name.startswith("test_state_round_trip_")
+            or name.startswith("test_worker_")
+        ):
+            if (
+                "thermalize_momenta" in message
+                and (legacy or {}).get("has_thermalize_momenta") is False
+            ):
+                reason = "锁定 ASE 缺少 thermalize_momenta API"
+        elif name.startswith("test_ase_npt_reuses_") and "DID NOT WARN" in message:
+            reason = "锁定 ASE 的 NPT 构造未发出测试期待的 FutureWarning"
+        elif (
+            name.startswith("test_kokkos_host_workers_match_")
+            and "compact_r1_model" in message
+        ):
+            if (legacy or {}).get("wrapper_strips_PYTHONPATH") is True:
+                reason = "隔离包装器移除 PYTHONPATH，子进程无法导入测试辅助模块"
+        elif name.startswith("test_openblas_openmp_runtime_must_match_"):
+            probes = (legacy or {}).get("standalone_blas_probes", [])
+            if len(probes) == 2 and all(
+                "GLIBCXX_3.4.29" in row.get("stderr", "") for row in probes
+            ):
+                reason = "独立 C++ 探针使用系统 libstdc++，缺少 GLIBCXX_3.4.29"
+        elif name.startswith("test_direct_renameat2_syscall_"):
+            if (legacy or {}).get("direct_renameat2_syscall", {}).get("errno") in (
+                22,
+                38,
+                95,
+            ):
+                reason = "共享测试文件系统/内核不支持该直接 renameat2 发布方式"
+        groups.setdefault(reason, []).append(name)
+    rows = [
+        (
+            reason,
+            len(names),
+            ", ".join(names),
+            link(baseline_xml)
+            if reason.startswith("干净上游")
+            else link(legacy_path)
+            if reason != "尚未归因"
+            else link(path),
+        )
+        for reason, names in groups.items()
+    ]
+    explained = len(candidate_failures) - len(groups.get("尚未归因", []))
+    checks.append(
+        (
+            "PASSED"
+            if reproduced and explained == len(candidate_failures) and not legacy_error
+            else "PENDING",
+            "完整 CPU 回归失败归因",
+            f"原始失败 {len(candidate_failures)} 项；同上游复现 {len(reproduced)} 项，环境/工具链解释 {explained - len(reproduced)} 项；原始测试仍未全通过",
+        )
+    )
+    if baseline:
+        overview.append(
+            (
+                "干净上游 aee9f980 四项对照",
+                junit_note(original) if original else "缺少 JUnit",
+                link(baseline_path),
+            )
+        )
+    return overview, rows, checks
 
 
 def worker_records(evidence, directory, summary):
@@ -379,6 +629,31 @@ def performance_status(summary, error, workers, waters):
             or data.get("block_seconds_requested", 0) < 10
         ):
             return "PENDING", "worker 尚未满足 FP64、每块至少 10 秒的正式协议"
+        provenance = data.get("provenance", {})
+        early = provenance.get("early_execution_environment", {})
+        threads = provenance.get("thread_environment", {})
+        if not threads or not early or not provenance.get("cpu_affinity"):
+            return "PENDING", "worker 尚缺导入前 affinity 与实际线程环境证据"
+        if (
+            early.get("applied") is not True
+            or len(early.get("allowed_after", [])) != 1
+            or len(provenance["cpu_affinity"]) != 1
+            or any(
+                str(threads.get(name)) != "1"
+                for name in (
+                    "OMP_NUM_THREADS",
+                    "KOKKOS_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "BLIS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS",
+                )
+            )
+        ):
+            return (
+                "FAILED",
+                "正式性能 worker 未证明固定单核和单线程；MD 并行策略不能替代此协议",
+            )
     if summary.get("passed") is not True:
         return "PENDING", "无明确通过汇总"
     return "PASSED", "已记录原模型/候选各 3 次独立完整 MD 计时"
@@ -407,6 +682,13 @@ def identities(evidence):
         "device_requested",
         "feature_device",
         "selector",
+        "qualification_source_commit",
+        "qualification_only",
+        "slurm_job_id",
+        "slurm_job",
+        "source_pristine",
+        "expected_runtime_sha256",
+        "loaded_runtime_sha256",
         "tensor_inventory_sha256",
         "positions_sha256",
         "velocities_sha256",
@@ -476,7 +758,11 @@ def render(root):
             error or (contract or {}).get("status", "未找到记录"),
         )
     )
-    for profile in PROFILES:
+    runtime_rows, runtime_statuses = [], {}
+    profiles = (*PROFILES, *DIAGNOSTIC_PROFILES)
+    for profile in profiles:
+        formal = profile in PROFILES
+        role = "正式" if formal else "历史诊断；未替代 cpu-omp"
         directory = root / "manifests/build" / profile
         built_path, built, built_error = evidence.first([directory / "built.json"])
         build_status = (
@@ -504,54 +790,128 @@ def render(root):
                 else explicit_status(version)
             )
         )
-        checks.extend(
-            (
-                (
-                    build_status,
-                    profile + " 构建完成标记",
-                    built_error
-                    or (built or {}).get(
-                        "error", "built.json 存在" if built else "未找到记录"
-                    ),
-                ),
-                (
-                    version_status,
-                    profile + " native probe",
-                    version_error
-                    or (version or {}).get("probe_status", "未找到有效 probe"),
-                ),
-            )
+        identity_status, identity_note = build_identity_status(
+            profile, built, version, version_path
         )
+        if built_error or version_error:
+            identity_status, identity_note = "FAILED", built_error or version_error
+        if formal:
+            checks.extend(
+                (
+                    (
+                        build_status,
+                        profile + " 构建完成标记",
+                        built_error
+                        or (built or {}).get(
+                            "error", "built.json 存在" if built else "未找到记录"
+                        ),
+                    ),
+                    (
+                        version_status,
+                        profile + " native probe",
+                        version_error
+                        or (version or {}).get("probe_status", "未找到有效 probe"),
+                    ),
+                    (
+                        identity_status,
+                        profile + " 构建/probe 身份一致性",
+                        identity_note,
+                    ),
+                )
+            )
         probe = (version or {}).get("probe", {})
         compiled = probe.get("build_info", {})
         descriptor = probe.get("backend", {})
         build_rows.append(
             (
                 profile,
+                role,
                 LABELS[build_status],
                 LABELS[version_status],
                 (built or {}).get("source_commit", "未提供"),
+                (built or {}).get("qualification_source_commit", "未单列"),
                 descriptor.get("selector", "未提供"),
-                compiled.get(
-                    "execution_space", compiled.get("kokkos_execution_space", "未提供")
-                ),
+                probe.get("device_environment", {}).get("execution_space", "未提供"),
+                probe.get("device_environment", {}).get("device_name", "未提供"),
+                LABELS[identity_status] + "；" + identity_note,
                 link(built_path) if built_path.is_file() else "—",
                 link(version_path) if version_path.is_file() else "—",
             )
         )
         tests = junit(evidence, profile)
         if not tests:
-            checks.append(
+            if formal:
+                checks.append(
+                    (
+                        "PENDING",
+                        profile + " JUnit 测试",
+                        "未找到 JUnit，构建标记不替代独立测试计数",
+                    )
+                )
+            test_rows.append((profile, role, "待完成", "未找到 JUnit", "—"))
+        for status, path, note, _ in tests:
+            if formal:
+                checks.append((status, profile + " JUnit " + path.name, note))
+            test_rows.append((profile, role, LABELS[status], note, link(path)))
+        if profile.startswith("cpu"):
+            status, path, report, note = cpu_runtime(evidence, profile)
+            if status == "PASSED":
+                context_info = report.get("qualification_context", {}).get(
+                    "native_build_info", {}
+                )
+                if not built or not compiled:
+                    status, note = (
+                        "PENDING",
+                        "doctor 已通过，等待当前构建/probe 身份记录齐全",
+                    )
+                elif any(
+                    context_info.get(key) != compiled.get(key)
+                    for key in (
+                        "source_commit",
+                        "source_content_sha256",
+                        "native_source_content_sha256",
+                    )
+                ):
+                    status, note = "FAILED", "doctor 与当前构建/probe 的源身份不匹配"
+            runtime_statuses[profile] = status
+            if formal:
+                checks.append(
+                    (status, profile + " 实际 Torch/POLAR 严格运行环境资格", note)
+                )
+            runtime_rows.append(
                 (
-                    "PENDING",
-                    profile + " JUnit 测试",
-                    "未找到 JUnit，构建标记不替代独立测试计数",
+                    profile,
+                    role,
+                    LABELS[status],
+                    note,
+                    link(path) if path.is_file() else "—",
                 )
             )
-            test_rows.append((profile, "待完成", "未找到 JUnit", "—"))
-        for status, path, note, _ in tests:
-            checks.append((status, profile + " JUnit " + path.name, note))
-            test_rows.append((profile, LABELS[status], note, link(path)))
+    regression_rows, attribution_rows, regression_checks = full_cpu_regression(evidence)
+    checks.extend(regression_checks)
+    diagnostic_rows = []
+    md_thread_rows = []
+    diagnostic_path, diagnostic, _ = evidence.first([root / "tests/cpu-profile8.json"])
+    if diagnostic:
+        concurrency = diagnostic.get("openmp_runtime", {}).get(
+            "kokkos_concurrency", "未提供"
+        )
+        for call in diagnostic.get("calls", []):
+            timings = call.get("timings_ms", {})
+            diagnostic_rows.append(
+                (
+                    call.get("label", "未提供"),
+                    concurrency,
+                    diagnostic.get("atoms", "未提供"),
+                    fmt(call.get("wall_ms")),
+                    fmt(timings.get("native_forward")),
+                    fmt(timings.get("torch_suffix_forward")),
+                    fmt(timings.get("torch_autograd")),
+                    fmt(timings.get("native_vjp")),
+                    "同步诊断；不计正式单核性能",
+                    link(diagnostic_path),
+                )
+            )
     for waters in WATERS:
         path, data, error = evidence.first(
             [root / f"benchmark/prepared-reference/water{waters:04d}.prepare.json"]
@@ -587,7 +947,9 @@ def render(root):
                     "—",
                 )
             )
-        for profile in PROFILES:
+        for profile in profiles:
+            formal = profile in PROFILES
+            role = "正式" if formal else "历史诊断；OpenMP 未资格"
             for phase, filename in (
                 ("validation", "validation.json"),
                 ("md100", "md.json"),
@@ -607,12 +969,38 @@ def render(root):
                 )
                 if failure:
                     status, note = "FAILED", failure
-                checks.append((status, f"{profile}/{waters}/{phase}", note))
+                if formal:
+                    checks.append((status, f"{profile}/{waters}/{phase}", note))
+                elif data:
+                    note += "；仅保留数值对照，不替代 cpu-omp 正式资格"
                 rows = measurements(data)
+                if phase.startswith("md") and data and profile.startswith("cpu"):
+                    for executor in ("original", "candidate"):
+                        provenance = data.get(executor, {})
+                        early = provenance.get("early_execution_environment", {})
+                        actual = provenance.get("actual_executor", {})
+                        md_thread_rows.append(
+                            (
+                                profile,
+                                waters,
+                                phase,
+                                executor,
+                                early.get("policy", "未提供"),
+                                str(early.get("allowed_after", "未提供")),
+                                str(provenance.get("cpu_affinity", "未提供")),
+                                json.dumps(
+                                    provenance.get("thread_environment", {}),
+                                    sort_keys=True,
+                                ),
+                                actual.get("kokkos_concurrency", "未提供"),
+                                link(path),
+                            )
+                        )
                 charge, spin = population_errors(rows)
                 physics_rows.append(
                     (
                         profile,
+                        role,
                         waters,
                         phase,
                         LABELS[status],
@@ -692,11 +1080,24 @@ def render(root):
             )
             if failure:
                 status, note = "FAILED", failure
-            checks.append((status, f"{profile}/{waters}/performance", note))
+            if (
+                profile.startswith("cpu")
+                and status == "PASSED"
+                and runtime_statuses.get(profile) != "PASSED"
+            ):
+                status, note = (
+                    "PENDING",
+                    "计时记录存在，但实际 Torch/POLAR 栈严格 doctor 尚未为 ok",
+                )
+            if formal:
+                checks.append((status, f"{profile}/{waters}/performance", note))
+            else:
+                note += "；历史 CPU 诊断，不计作正式性能资格"
             executors = (summary or {}).get("executors", {})
             perf_rows.append(
                 (
                     profile,
+                    role,
                     waters,
                     LABELS[status],
                     fmt(executors.get("original", {}).get("repeats")),
@@ -756,6 +1157,8 @@ def render(root):
         "",
         "本报告只读取现有文件，没有运行模型、测试或 MD。待完成表示未找到完成证据或正式协议不完整，不表示任务已经调度；失败记录不会被缺失的新记录覆盖。只有时间更新且正式协议完整通过的记录可以替代历史失败，历史证据仍单列。合约清点只证明序列化/权重归属，不证明数值正确性。",
         "",
+        "正式 CPU 优先使用独立的 cpu-omp 配置；它必须在真实 Torch/POLAR 能量和力计算后通过严格 doctor。旧 cpu 的数值、MD 和计时记录保留为历史诊断，不转记为 cpu-omp 的结果，也不计入正式配置的完成项目。GPU 编译提交与后续资格脚本提交分别记录。",
+        "",
         "## 通过、待完成与失败",
         "",
     ]
@@ -780,11 +1183,15 @@ def render(root):
             "构建与设备",
             [
                 "profile",
+                "用途",
                 "构建",
                 "probe",
-                "source commit",
+                "编译 source commit",
+                "资格脚本 commit",
                 "backend",
                 "execution space",
+                "实际设备",
+                "身份一致性",
                 "build 证据",
                 "probe 证据",
             ],
@@ -792,8 +1199,39 @@ def render(root):
         ),
         (
             "实际测试",
-            ["profile", "状态", "实际计数与真实模型 oracle", "证据"],
+            ["profile", "用途", "状态", "实际计数与真实模型 oracle", "证据"],
             test_rows,
+        ),
+        (
+            "CPU 实际 Torch/POLAR 栈运行环境",
+            ["profile", "用途", "严格资格", "实际检查", "证据"],
+            runtime_rows,
+        ),
+        (
+            "完整 CPU 回归与干净上游对照",
+            ["范围", "原始测试计数", "证据"],
+            regression_rows,
+        ),
+        (
+            "完整 CPU 回归失败归因",
+            ["证据支持的原因", "失败数", "实际失败 testcases", "归因证据"],
+            attribution_rows,
+        ),
+        (
+            "旧 CPU 配置单次诊断",
+            [
+                "调用",
+                "实际 Kokkos workers",
+                "atoms",
+                "wall ms",
+                "native forward ms",
+                "Torch suffix ms",
+                "Torch autograd ms",
+                "native VJP ms",
+                "用途",
+                "证据",
+            ],
+            diagnostic_rows,
         ),
         (
             "共同准备态",
@@ -814,6 +1252,7 @@ def render(root):
             "完整物理对照",
             [
                 "profile",
+                "用途",
                 "waters",
                 "阶段",
                 "状态",
@@ -852,9 +1291,26 @@ def render(root):
             drift_rows,
         ),
         (
+            "CPU MD 实际线程策略",
+            [
+                "profile",
+                "waters",
+                "阶段",
+                "executor",
+                "导入前策略",
+                "导入前 affinity",
+                "实际 affinity",
+                "实际线程环境",
+                "记录的 native concurrency",
+                "证据",
+            ],
+            md_thread_rows,
+        ),
+        (
             "完整 ASE MD 性能",
             [
                 "profile",
+                "用途",
                 "waters",
                 "状态",
                 "original repeats",
@@ -903,6 +1359,23 @@ def render(root):
     ]
     for title, headers, rows in sections:
         lines.extend(["## " + title, "", table(headers, rows), ""])
+    if evidence.historical_tests:
+        lines.extend(
+            [
+                "## 已归档的测试尝试",
+                "",
+                "attempts/ 下的历史 JUnit 不替代当前配置目录的测试结果；以下保留原始状态，不计入当前正式资格。",
+                "",
+                table(
+                    ["profile", "当时状态", "原始测试计数", "证据"],
+                    [
+                        (profile, LABELS[status], note, link(path))
+                        for profile, path, status, note in evidence.historical_tests
+                    ],
+                ),
+                "",
+            ]
+        )
     if evidence.superseded_failures:
         lines.extend(
             [
@@ -924,7 +1397,18 @@ def render(root):
             "",
             "正式物理阈值：总胞能量误差 ≤ 1e-4 eV，最大力分量误差 ≤ 1e-5 eV/Å，初始及两轮更新后的 |Q−1| ≤ 1e-9 e、|spin population| ≤ 1e-9。水合壳按 O–Li 最小镜像距离 ≤ 3.2 Å 选取整分子。NVE 目标为 0.25 fs、100/1000 步；漂移仅报告实际数值，没有自创漂移阈值。正式性能为 FP64、原模型/候选各 3 次独立进程、每块至少 10 秒。",
             "",
+            "MD 可以单独记录不同的 CPU 线程策略；其实际 affinity、线程环境和已提供的 native concurrency 单列。轨迹运行时间不替代严格单核的正式 benchmark，缺少实际并行计数时不从环境变量推断已使用多少工作线程。",
+            "",
             "跳过的测试没有被当作已验证能力。原模型/候选速度只取已有汇总，区域最大值与阶段中位数由实际记录计算。NVIDIA own PID 数值包含 Torch/native 分配；Torch-only 不代表进程显存。all-GPU 数据含其他进程，不能当作模型独占显存。未提供的计数或数值保持缺失，没有填零。",
+            "",
+            "完整 CPU 回归的原始失败数保持不变。干净上游对照通过只表示同名失败及打印误差指标复现，不表示那四项测试通过；13 项环境解释也不转记为 passed。JUnit 的 teardown error 可以与同一个 testcase 的 failure 同时存在，不据此减出负的 passed 数。",
+            "",
+            "## 按现有缺口继续",
+            "",
+            "1. 若上表 cpu-omp 仍有缺口，先补全其构建身份、真实 Torch/POLAR 严格 doctor 和独立 oracle；旧 cpu 的长轨迹可保留科学对照证据，但不能替代新配置的资格。",
+            "2. 对正式配置和各尺寸，按 validation、100 步 NVE、1000 步 NVE 的顺序补全缺失记录。部分轨迹仅报告最后实际采样步，不将等待或已提交当作完成。",
+            "3. 正式速度对比需原模型/候选各三个独立进程，每块至少十秒、FP64、单物理核、profile=False，并保留各 worker 初态、二进制和运行库身份。没有完整计时证据前不填入速度结论。",
+            "4. 完整回归仍未全通过时，单独记录环境/API 限制和干净上游复现，不放宽物理或数值阈值来消除失败。",
             "",
             "## 运行、checkpoint 与二进制身份",
             "",

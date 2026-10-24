@@ -33,6 +33,12 @@ def main():
         donor / "src/polar/polar-mace0316-torch260cu126-cueq091-a4470e17e377/wheels"))
     env["CMAKE_ARGS"] = "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
     python = root / "opt" / profile / "bin/python"
+    env["PATH"] = str(python.parent) + os.pathsep + env["PATH"]
+    env["UV_CACHE_DIR"] = str(root / "build/cache" / profile / "uv")
+    env["UV_FIND_LINKS"] = env["PIP_FIND_LINKS"]
+    env["UV_PYTHON_DOWNLOADS"] = "never"
+    subprocess.run([str(python), "-m", "pip", "install", "--no-index", "uv==0.8.22"],
+                   env=env, check=True)
     wheels = root / "build/wheels"
     wheels.mkdir(exist_ok=True)
     manifest = root / "manifests/build" / profile
@@ -81,6 +87,27 @@ def main():
         (manifest / (label + ".txt")).write_text(result.stdout + result.stderr)
         if result.returncode:
             raise RuntimeError(label + " probe failed")
+        if label == "version":
+            report = json.loads(result.stdout)
+            if report.get("probe_status") != "ok":
+                raise RuntimeError("Native probe unavailable: " + str(report.get("probe_error")))
+            probe = report["probe"]
+            descriptor, compiled = probe["backend"], probe["build_info"]
+            if descriptor.get("selector") != env["SYMMETRIX_BACKEND"]:
+                raise RuntimeError("The probe selected a different backend")
+            expected = json.loads(subprocess.check_output(
+                [str(python), "-c", "import json; from pathlib import Path; "
+                 "from tools._symmetrix_build.source_provenance import "
+                 "symmetrix_source_fingerprint, symmetrix_native_source_fingerprint; "
+                 "print(json.dumps({'source_content_sha256': symmetrix_source_fingerprint(Path.cwd()), "
+                 "'native_source_content_sha256': symmetrix_native_source_fingerprint(Path.cwd())}))"],
+                cwd=source, env=env, text=True))
+            for identity in (descriptor, compiled):
+                if identity.get("source_commit") != commit or identity.get("source_dirty"):
+                    raise RuntimeError("Native probe source revision differs from the clean checkout")
+                for key, value in expected.items():
+                    if len(value) != 64 or identity.get(key) != value:
+                        raise RuntimeError("Native probe source fingerprint mismatch: " + key)
     subprocess.run([str(python), "-m", "pytest", "-q", "symmetrix/test/test_polar.py", "symmetrix/test/test_polar_features.py"], cwd=source, env=env, check=True)
     write_json(manifest / "built.json", {"source_commit": commit, "profile": profile,
         "python": str(python), "slurm_job_id": os.environ["SLURM_JOB_ID"],

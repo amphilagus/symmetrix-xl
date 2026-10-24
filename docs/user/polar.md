@@ -293,8 +293,12 @@ JUnit attempts from each profile's current qualification run.
 CPU MD correctness runs can explicitly use `md --cpu-threads 8` when the
 allocation provides eight physical cores. The driver applies affinity before
 numerical imports, excludes SMT siblings, uses eight Kokkos/OpenMP threads and
-one BLAS thread, and verifies actual native concurrency. GPU calculations and
-all formal `benchmark`/`_worker` throughput runs require one CPU thread.
+verifies actual native concurrency. OpenMP OpenBLAS shares that team: calls
+inside Kokkos workers execute with one local BLAS thread, while calls outside
+worker regions may use the eight-thread team. Nested parallelism is disabled.
+`OPENBLAS_NUM_THREADS=1` records an environment setting that an OpenMP BLAS build
+can ignore; the native runtime record reports its actual global thread count.
+GPU calculations and all formal `benchmark`/`_worker` throughput runs require one CPU thread.
 
 For formal CPU deployment, run `cpu_toolchain.sbatch`, `prepare.sbatch` with
 profile `cpu-omp`, and `build.sbatch` with profile `cpu-omp` in that order, using
@@ -306,8 +310,8 @@ sbatch deployment/polar/qualify_cpu.sbatch "$DEPLOYMENT_ROOT"
 ```
 
 This requires eight distinct physical cores. It checks the qualified binary and
-strict doctor, runs MD100 and MD1000 with eight cores, then validates all four
-sizes and times them on one core. CPU timing workers use two excluded warmup
+strict doctor, runs the representative 64-water MD100 and MD1000 cases with
+eight cores, then validates all four sizes and times them on one core. CPU timing workers use two excluded warmup
 steps, three independent processes per executor, and blocks of at least ten
 seconds. Existing results are preserved and rejected as output destinations.
 

@@ -44,6 +44,7 @@ def _early_execution_environment():
         "policy": "one logical CPU per physical core; SMT siblings excluded",
         "requested_threads": threads,
         "formal_benchmark_threads": 1,
+        "blas_policy": "thread environment set to one; OpenMP BLAS shares the OpenMP team outside worker regions; nested parallelism disabled",
     }
     if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
         allowed = sorted(os.sched_getaffinity(0))
@@ -586,6 +587,7 @@ def provenance(args, calculator=None, executor=None):
                 "MKL_NUM_THREADS",
                 "BLIS_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS",
+                "OMP_MAX_ACTIVE_LEVELS",
             )
         },
     }
@@ -1505,7 +1507,7 @@ def parser():
                 "--cpu-threads",
                 type=int,
                 default=1,
-                help="CPU correctness MD only; distinct physical cores, BLAS stays one thread. Formal benchmarks always use one core.",
+                help="CPU correctness MD only; distinct physical cores, shared OpenMP team and no nested parallelism. Formal benchmarks always use one core.",
             )
             sub.add_argument("--steps", type=int, default=100)
             sub.add_argument("--sample-interval", type=int, default=10)

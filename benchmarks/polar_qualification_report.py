@@ -462,14 +462,42 @@ def build_identity_status(profile, built, version, version_path):
 
 
 def full_cpu_regression(evidence):
+    current_path = evidence.root / "tests/cpu-omp-full.xml"
+    current, current_error = (
+        junit_details(evidence, current_path)
+        if current_path.is_file()
+        else (None, None)
+    )
+    current_status = current["status"] if current else "PENDING"
+    current_note = (
+        junit_note(current)
+        if current
+        else f"新 XML 尚不可解析：{current_error}"
+        if current_error
+        else "未找到 cpu-omp-full.xml；旧 cpu 结果不替代当前配置"
+    )
+    overview = [
+        (
+            "cpu-omp（当前独立运行环境）",
+            LABELS[current_status] + "；" + current_note,
+            link(current_path) if current_path.is_file() else "未提供",
+        )
+    ]
+    checks = [(current_status, "cpu-omp 完整回归原始结果", current_note)]
     path = evidence.root / "tests/cpu-full.xml"
     if not path.is_file():
-        return [], [], [("PENDING", "完整 CPU 回归", "未找到 cpu-full.xml")]
+        return overview, [], checks
     details, error = junit_details(evidence, path)
     if error:
-        return [], [], [("FAILED", "完整 CPU 回归", error)]
-    overview = [("cpu（历史锁定运行环境）", junit_note(details), link(path))]
-    checks = [(details["status"], "完整 CPU 回归原始结果", junit_note(details))]
+        checks.append(("FAILED", "历史 cpu 完整回归 XML", error))
+        return overview, [], checks
+    overview.append(
+        (
+            "cpu（历史锁定运行环境；不替代 cpu-omp）",
+            LABELS[details["status"]] + "；" + junit_note(details),
+            link(path),
+        )
+    )
     baseline_dir = evidence.root / "tests/upstream-aee9f980"
     baseline_path, baseline, baseline_error = evidence.first(
         [baseline_dir / "baseline.json"]
@@ -563,14 +591,14 @@ def full_cpu_regression(evidence):
             "PASSED"
             if reproduced and explained == len(candidate_failures) and not legacy_error
             else "PENDING",
-            "完整 CPU 回归失败归因",
-            f"原始失败 {len(candidate_failures)} 项；同上游复现 {len(reproduced)} 项，环境/工具链解释 {explained - len(reproduced)} 项；原始测试仍未全通过",
+            "历史 cpu 完整回归失败归因",
+            f"历史 cpu 原始失败 {len(candidate_failures)} 项；同上游复现 {len(reproduced)} 项，环境/工具链解释 {explained - len(reproduced)} 项；不代表当前 cpu-omp 的测试计数或归因",
         )
     )
     if baseline:
         overview.append(
             (
-                "干净上游 aee9f980 四项对照",
+                "历史 cpu 对照：干净上游 aee9f980 四项复现",
                 junit_note(original) if original else "缺少 JUnit",
                 link(baseline_path),
             )
@@ -761,14 +789,56 @@ def nsys_statistics(path):
     return reports
 
 
+def module_diagnostic_status(data, error):
+    if error or explicit_status(data) == "FAILED":
+        return "FAILED", error or str(data.get("error", "模块诊断明确失败"))
+    if not data:
+        return "PENDING", "未找到模块诊断"
+    calls = data.get("calls", [])
+    if (
+        data.get("precision") != "float64"
+        or "synchronized" not in data.get("scope", "")
+        or not calls
+        or len(calls) != data.get("diagnostic_calls")
+    ):
+        return "PENDING", "FP64、同步范围或完整调用数证据尚未齐全"
+    parities = [row.get("instrumentation_parity", {}) for row in calls]
+    parities.append(data.get("restored_instrumentation_parity", {}))
+    for parity in parities:
+        for key, limit in (("energy_max_abs_eV", 1e-8), ("force_max_abs_eV_A", 1e-10)):
+            value = parity.get(key)
+            if not number(value):
+                return "PENDING", "尚缺逐次插桩及恢复后的 E/F 一致性记录"
+            if value < 0 or value > limit:
+                return "FAILED", f"插桩前后 {key}={value} 超出 {limit}"
+    summary = data.get("summary", {})
+    if not summary.get("forward_regions") or any(
+        not number(summary.get(key, {}).get("median"))
+        for key in ("long_range_electrostatic_forward_ms", "whole_suffix_autograd_ms")
+    ):
+        return "PENDING", "尚缺模块 forward、长程 forward 或整个 autograd 耗时"
+    if explicit_status(data) != "PASSED":
+        return "PENDING", "尚无模块诊断完整通过标记"
+    return (
+        "PASSED",
+        f"{len(calls)} 次 FP64 同步诊断，逐次插桩及恢复后的 E/F 均在阈值内一致",
+    )
+
+
 def module_diagnostics(evidence):
     summaries, modules, stages, memory, synchronizations = ([] for _ in range(5))
+    outcomes = {}
     directory = evidence.root / "benchmark/module-profile"
     for path in sorted(directory.glob("*/*-modules.json")):
         if path.name.endswith("-traced-modules.json"):
             continue
         data, error = evidence.read(path)
-        label = f"{path.stem.removesuffix('-modules')}/{path.parent.name}"
+        profile = path.stem.removesuffix("-modules")
+        label = f"{profile}/{path.parent.name}"
+        status, note = module_diagnostic_status(data, error)
+        outcomes.setdefault(profile, []).append(
+            (path.stat().st_mtime_ns, path, status, note)
+        )
         if not data:
             summaries.append((label, f"失败：{error}", *(["未提供"] * 9), link(path)))
             continue
@@ -785,7 +855,7 @@ def module_diagnostics(evidence):
         summaries.append(
             (
                 label,
-                LABELS[explicit_status(data)],
+                LABELS[status],
                 data.get("atoms", "未提供"),
                 data.get("diagnostic_calls", "未提供"),
                 data.get("precision", "未提供"),
@@ -861,7 +931,19 @@ def module_diagnostics(evidence):
                         link(statistics_path),
                     )
                 )
-    return summaries, modules, stages, memory, synchronizations
+    checks = []
+    for profile in PROFILES:
+        candidates = outcomes.get(profile, [])
+        if candidates:
+            _, path, status, note = max(candidates, key=lambda row: row[0])
+            note += "；" + str(path)
+        else:
+            status, note = (
+                "PENDING",
+                "未找到当前配置的同步模块诊断及前后 E/F 一致性记录",
+            )
+        checks.append((status, profile + " 同步模块诊断及前后 E/F 一致性", note))
+    return summaries, modules, stages, memory, synchronizations, checks
 
 
 def pipeline_records(evidence):
@@ -1148,16 +1230,26 @@ def render(root):
                 )
                 if failure:
                     status, note = "FAILED", failure
-                if formal:
+                required_phase = phase == "validation" or waters == 64
+                if formal and required_phase:
                     checks.append((status, f"{profile}/{waters}/{phase}", note))
                 elif data:
-                    note += "；仅保留数值对照，不替代 cpu-omp 正式资格"
+                    note += (
+                        "；额外 MD 覆盖，不替代 64 水代表体系"
+                        if formal
+                        else "；仅保留数值对照，不替代 cpu-omp 正式资格"
+                    )
+                phase_label = LABELS[status]
+                if not required_phase and not data and not error and not failure:
+                    phase_label = "未执行（本轮代表体系为64水）"
+                    note = "本轮只要求 64 水代表体系 MD100/MD1000；此项不计入待完成"
                 rows = measurements(data)
                 if phase.startswith("md") and data and profile.startswith("cpu"):
                     for executor in ("original", "candidate"):
                         provenance = data.get(executor, {})
                         early = provenance.get("early_execution_environment", {})
                         actual = provenance.get("actual_executor", {})
+                        runtime = actual.get("openmp_runtime", {})
                         md_thread_rows.append(
                             (
                                 profile,
@@ -1171,7 +1263,14 @@ def render(root):
                                     provenance.get("thread_environment", {}),
                                     sort_keys=True,
                                 ),
-                                actual.get("kokkos_concurrency", "未提供"),
+                                actual.get(
+                                    "kokkos_concurrency",
+                                    runtime.get("kokkos_concurrency", "未提供"),
+                                ),
+                                runtime.get("host_blas", {}).get(
+                                    "openblas_threads", "未提供"
+                                ),
+                                runtime.get("omp_max_active_levels", "未提供"),
                                 link(path),
                             )
                         )
@@ -1182,7 +1281,7 @@ def render(root):
                         role,
                         waters,
                         phase,
-                        LABELS[status],
+                        phase_label,
                         fmt(maximum(rows, "absolute_total_energy_error_eV")),
                         fmt(maximum(rows, "maximum_force_component_error_eV_A")),
                         fmt(charge),
@@ -1326,9 +1425,15 @@ def render(root):
                         "单独同步诊断调用；不计入 throughput",
                     )
                 )
-    module_rows, module_region_rows, module_stage_rows, copy_rows, sync_rows = (
-        module_diagnostics(evidence)
-    )
+    (
+        module_rows,
+        module_region_rows,
+        module_stage_rows,
+        copy_rows,
+        sync_rows,
+        module_checks,
+    ) = module_diagnostics(evidence)
+    checks.extend(module_checks)
     pipeline_rows = pipeline_records(evidence)
     counts = {status: sum(row[0] == status for row in checks) for status in LABELS}
     lines = [
@@ -1396,7 +1501,7 @@ def render(root):
             regression_rows,
         ),
         (
-            "完整 CPU 回归失败归因",
+            "历史 cpu 完整回归失败归因（不套用到 cpu-omp）",
             ["证据支持的原因", "失败数", "实际失败 testcases", "归因证据"],
             attribution_rows,
         ),
@@ -1496,6 +1601,8 @@ def render(root):
                 "实际 affinity",
                 "实际线程环境",
                 "记录的 native concurrency",
+                "实际 OpenBLAS 全局线程数",
+                "实际 omp_max_active_levels",
                 "证据",
             ],
             md_thread_rows,
@@ -1641,11 +1748,11 @@ def render(root):
         [
             "## 判定边界",
             "",
-            "正式物理阈值：总胞能量误差 ≤ 1e-4 eV，最大力分量误差 ≤ 1e-5 eV/Å，初始及两轮更新后的 |Q−1| ≤ 1e-9 e、|spin population| ≤ 1e-9。水合壳按 O–Li 最小镜像距离 ≤ 3.2 Å 选取整分子。NVE 目标为 0.25 fs、100/1000 步；漂移仅报告实际数值，没有自创漂移阈值。正式性能为 FP64、原模型/候选各 3 次独立进程、每块至少 10 秒。",
+            "正式物理阈值：总胞能量误差 ≤ 1e-4 eV，最大力分量误差 ≤ 1e-5 eV/Å，初始及两轮更新后的 |Q−1| ≤ 1e-9 e、|spin population| ≤ 1e-9。水合壳按 O–Li 最小镜像距离 ≤ 3.2 Å 选取整分子。四尺寸要求 validation/benchmark；NVE 只要求 64 水代表体系，0.25 fs、100/1000 步；漂移仅报告实际数值，没有自创漂移阈值。正式性能为 FP64、原模型/候选各 3 次独立进程、每块至少 10 秒。",
             "",
-            "MD 可以单独记录不同的 CPU 线程策略；其实际 affinity、线程环境和已提供的 native concurrency 单列。轨迹运行时间不替代严格单核的正式 benchmark，缺少实际并行计数时不从环境变量推断已使用多少工作线程。",
+            "MD 可以单独记录不同的 CPU 线程策略；实际 affinity、线程环境、native concurrency、OpenBLAS 全局线程数和 omp_max_active_levels 分列。OpenMP OpenBLAS 的实际全局线程数可以为 8，即使 OPENBLAS_NUM_THREADS=1；共享 OpenMP 且嵌套层数为 1 不等于全局 BLAS 线程数为 1，也不单独证明每次 BLAS 调用启动多少 workers。轨迹运行时间不替代严格单核的正式 benchmark，缺少实际计数时不从环境变量推断。",
             "",
-            "流水线 passed 只覆盖其实际 stage 输出。例如四尺寸 validation/benchmark 与一个尺寸 MD 的流水线，不证明其余尺寸也完成 MD；物理对照表仍逐尺寸判断。模块诊断自动发现 benchmark/module-profile/<job>/<profile>-modules.json，包括后续 CPU 记录；没有插桩前后 E/F 一致性记录时不推断一致。",
+            "流水线 passed 只覆盖其实际 stage 输出。非 64 水尺寸没有 MD 记录时标为未执行，不计作本轮待完成；额外 MD 记录仍按实际状态展示。模块诊断自动发现 benchmark/module-profile/<job>/<profile>-modules.json，cpu-omp/sm80/sm90 各自为必需项；每配置以最新记录判定，历史失败仍保留在诊断表。必须有完整同步耗时及逐次插桩、恢复后的 E/F 一致性记录，才能计作通过。",
             "",
             "模块计时包含 Python/hooks 和逐区域 GPU 同步开销，不属于正式吞吐量。选定长程 forward 为 descriptor geometry、两次更新×两 spin 的四次 dynamic field 以及 Coulomb energy；场更新 MLP、局部电子能、局部 readout 分列。倒空间枚举、归一化及模块外的平衡步骤仍在其余 suffix 中。整个 Torch autograd 包含所有后缀导数，未独立测出长程 backward。各项中位数分别计算，不能要求其相加严格等于总中位数。",
             "",
@@ -1655,12 +1762,12 @@ def render(root):
             "",
             "跳过的测试没有被当作已验证能力。原模型/候选速度只取已有汇总，区域最大值与阶段中位数由实际记录计算。NVIDIA own PID 数值包含 Torch/native 分配；Torch-only 不代表进程显存。all-GPU 数据含其他进程，不能当作模型独占显存。未提供的计数或数值保持缺失，没有填零。",
             "",
-            "完整 CPU 回归的原始失败数保持不变。干净上游对照通过只表示同名失败及打印误差指标复现，不表示那四项测试通过；13 项环境解释也不转记为 passed。JUnit 的 teardown error 可以与同一个 testcase 的 failure 同时存在，不据此减出负的 passed 数。",
+            "当前完整 CPU 回归只取 cpu-omp-full.xml；未完成前保持待完成，不从旧 cpu-full.xml 借用计数。历史 cpu 的原始 1230 passed / 17 failed / 394 skipped 及四项干净上游复现独立保留，不套用到新配置。历史上游对照通过只表示同名失败及打印误差指标复现，不表示那四项测试通过；13 项历史环境解释也不转记为 passed。JUnit 的 teardown error 可以与同一个 testcase 的 failure 同时存在，不据此减出负的 passed 数。",
             "",
             "## 按现有缺口继续",
             "",
             "1. 若上表 cpu-omp 仍有缺口，先补全其构建身份、真实 Torch/POLAR 严格 doctor 和独立 oracle；旧 cpu 的长轨迹可保留科学对照证据，但不能替代新配置的资格。",
-            "2. 对正式配置和各尺寸，按 validation、100 步 NVE、1000 步 NVE 的顺序补全缺失记录。部分轨迹仅报告最后实际采样步，不将等待或已提交当作完成。",
+            "2. 补全正式配置的四尺寸 validation/benchmark，以及 64 水代表体系的 100/1000 步 NVE 和各配置模块诊断。部分轨迹仅报告最后实际采样步，不将等待或已提交当作完成。",
             "3. 正式速度对比需原模型/候选各三个独立进程，每块至少十秒、FP64、单物理核、profile=False，并保留各 worker 初态、二进制和运行库身份。没有完整计时证据前不填入速度结论。",
             "4. 完整回归仍未全通过时，单独记录环境/API 限制和干净上游复现，不放宽物理或数值阈值来消除失败。",
             "",

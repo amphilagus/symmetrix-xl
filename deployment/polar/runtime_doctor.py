@@ -30,6 +30,7 @@ def main():
         cell=[8, 8, 8],
         pbc=True,
     )
+    atoms.info.update(charge=1.0, spin=1.0, external_field=[0.0, 0.0, 0.0])
     calc = SymmetrixPolar(args.checkpoint, device="cpu", bridge="host")
     atoms.calc = calc
     energy = atoms.get_potential_energy()
@@ -43,6 +44,7 @@ def main():
     )
     report["qualification_context"] = {
         "torch_version": torch.__version__,
+        "polar_state": dict(atoms.info),
         "energy_eV": energy,
         "maximum_force_eV_A": float(abs(forces).max()),
         "executor": {

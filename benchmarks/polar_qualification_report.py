@@ -9,6 +9,7 @@ outside every Git checkout, including the deployed source checkout.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -606,6 +607,174 @@ def full_cpu_regression(evidence):
     return overview, rows, checks
 
 
+def current_cpu_regression_attribution(evidence):
+    """Bind current attribution to exact JUnit issues; never promote failures."""
+    path = evidence.root / "tests/cpu-omp-full-analysis.json"
+    analysis, error = evidence.read(path)
+    label = "当前 cpu-omp 完整回归失败归因"
+
+    def unavailable(status, note):
+        return [(LABELS[status], "—", note, "未采用分类", link(path))], [
+            (status, label, note)
+        ]
+
+    if error:
+        return unavailable("FAILED", error)
+    if analysis is None:
+        return unavailable("PENDING", "未找到当前分析；不套用历史 cpu 的归因")
+    xml_path = evidence.root / "tests/cpu-omp-full.xml"
+    if not xml_path.is_file():
+        return unavailable("PENDING", "未找到当前 cpu-omp-full.xml，无法绑定分析")
+    details, error = junit_details(evidence, xml_path)
+    if error:
+        return unavailable("FAILED", "当前 JUnit 无法解析：" + error)
+
+    def issues(cases):
+        return Counter(
+            (
+                case.get("classname", "") + "::" + case.get("name", ""),
+                child.get("message", ""),
+            )
+            for case in cases
+            for child in case
+            if child.tag in ("failure", "error")
+        )
+
+    try:
+        if analysis.get("schema") != 1:
+            raise ValueError("不支持的分析 schema")
+        declared_junit = Path(analysis["junit"])
+        if not declared_junit.is_absolute():
+            raise ValueError("分析 junit 必须声明原始部署的绝对路径")
+        declared_root = declared_junit.parent.parent
+        if analysis.get("junit_sha256") != file_hash(xml_path):
+            raise ValueError("分析 junit_sha256 与当前 XML 不一致；拒绝使用旧分类")
+        if analysis.get("counts") != details["counts"]:
+            raise ValueError("分析 counts 与当前原始 JUnit 计数不一致")
+        categories = analysis.get("categories")
+        if not isinstance(categories, dict) or any(
+            not isinstance(rows, list) for rows in categories.values()
+        ):
+            raise ValueError("分析 categories 结构无效")
+        classified = [row for rows in categories.values() for row in rows]
+        if any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("testcase"), str)
+            or not isinstance(row.get("message"), str)
+            for row in classified
+        ):
+            raise ValueError("分析的 testcase/message 必须是字符串")
+        expected_count = details["counts"]["failed"] + details["counts"]["errors"]
+        if len(classified) != expected_count:
+            raise ValueError("分类总数不等于原始 failed + errors")
+        if Counter((row["testcase"], row["message"]) for row in classified) != issues(
+            details["cases"]
+        ):
+            raise ValueError("分类的 testcase/message 与当前原始失败逐项不一致")
+
+        def checked_artifact(value, expected_hash):
+            artifact = Path(value)
+            if artifact.is_absolute():
+                try:
+                    artifact = artifact.relative_to(declared_root)
+                except ValueError as failure:
+                    raise ValueError(
+                        f"分析引用的证据不在声明的部署根目录下：{value}"
+                    ) from failure
+            artifact = (evidence.root / artifact).resolve()
+            if not artifact.is_relative_to(evidence.root.resolve()):
+                raise ValueError(f"分析引用的证据映射越界：{value}")
+            if not artifact.is_file():
+                raise ValueError(f"分析引用的证据缺失：{artifact}")
+            digest = file_hash(artifact)
+            evidence.file_inventory[str(artifact)] = digest
+            if digest != expected_hash:
+                raise ValueError(f"分析引用的证据 SHA-256 不一致：{artifact}")
+            return artifact
+
+        environment = checked_artifact(
+            analysis["compiler_environment"], analysis["compiler_environment_sha256"]
+        )
+        _, environment_error = evidence.read(environment)
+        if environment_error:
+            raise ValueError("编译环境 JSON 无法解析：" + environment_error)
+        probe = analysis.get("standalone_probe", {})
+        if not isinstance(probe, dict) or not isinstance(
+            probe.get("elf_records", []), list
+        ):
+            raise ValueError("standalone_probe/elf_records 结构无效")
+        elf_paths = [
+            checked_artifact(row["output"], row["sha256"])
+            for row in probe.get("elf_records", [])
+        ]
+        if probe and not elf_paths:
+            raise ValueError("standalone probe 分析缺少绑定哈希的 ELF 记录")
+    except (KeyError, TypeError, ValueError, OSError) as failure:
+        return unavailable("FAILED", "分析未通过证据核对：" + str(failure))
+
+    def message_excerpt(message):
+        lines = [line.strip() for line in message.splitlines() if line.strip()]
+        selected = [
+            line
+            for line in lines
+            if "ImportError:" in line
+            or "ModuleNotFoundError:" in line
+            or line.startswith("Max absolute difference:")
+        ]
+        return "；".join(selected or lines[:1])
+
+    rows = [
+        (
+            "原始状态保持" + LABELS[details["status"]],
+            "—",
+            junit_note(details) + "；分析只解释失败，不将失败转记为通过",
+            "源提交 " + str(analysis.get("source_commit", "未提供")),
+            link(xml_path) + "；" + link(path) + "；" + link(environment),
+        )
+    ]
+    for category, members in categories.items():
+        rows.append(
+            (
+                category,
+                len(members),
+                "；".join(
+                    member["testcase"] + ": " + message_excerpt(member["message"])
+                    for member in members
+                ),
+                "分析记录的旧 cpu 对照：同名失败 "
+                + str(
+                    sum(
+                        member.get("same_failed_name_in_old_cpu") is True
+                        for member in members
+                    )
+                )
+                + f"/{len(members)}；message 逐字相同 "
+                + str(
+                    sum(
+                        member.get("same_failure_message_in_old_cpu") is True
+                        for member in members
+                    )
+                )
+                + f"/{len(members)}；归因以本轮失败文本为准",
+                link(path) + "；" + link(xml_path),
+            )
+        )
+    if probe:
+        rows.extend(
+            (
+                "standalone probe：" + kind,
+                "—",
+                probe.get(key, "未提供"),
+                "未执行 probe；后续 loader/dlopen 行为不称为实测",
+                "；".join(map(link, [path, *elf_paths])),
+            )
+            for kind, key in (("实证", "observed"), ("推断", "inference"))
+        )
+    # Raw regression status is already a check in full_cpu_regression. An
+    # attribution passing its integrity checks is not a passing test result.
+    return rows, []
+
+
 def worker_records(evidence, directory, summary):
     paths = set(directory.glob("original-*.json")) | set(
         directory.glob("candidate-*.json")
@@ -1150,6 +1319,10 @@ def render(root):
             )
     regression_rows, attribution_rows, regression_checks = full_cpu_regression(evidence)
     checks.extend(regression_checks)
+    current_attribution_rows, current_attribution_checks = (
+        current_cpu_regression_attribution(evidence)
+    )
+    checks.extend(current_attribution_checks)
     diagnostic_rows = []
     md_thread_rows = []
     diagnostic_path, diagnostic, _ = evidence.first([root / "tests/cpu-profile8.json"])
@@ -1499,6 +1672,17 @@ def render(root):
             "完整 CPU 回归与干净上游对照",
             ["范围", "原始测试计数", "证据"],
             regression_rows,
+        ),
+        (
+            "当前 cpu-omp 完整回归失败归因",
+            [
+                "本轮分类/原始状态",
+                "失败/错误数",
+                "本轮 testcase 与失败文本",
+                "与历史的关系/判定边界",
+                "证据",
+            ],
+            current_attribution_rows,
         ),
         (
             "历史 cpu 完整回归失败归因（不套用到 cpu-omp）",

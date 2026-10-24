@@ -320,6 +320,12 @@ def junit(evidence, profile):
                     paths.update(tagged.rglob("*.xml"))
     rows = []
     for path in sorted(paths):
+        # Whole-suite results have dedicated current/historical sections.
+        if path in {
+            evidence.root / "tests/cpu-full.xml",
+            evidence.root / "tests/cpu-omp-full.xml",
+        }:
+            continue
         details, error = junit_details(evidence, path)
         if error:
             rows.append(("FAILED", path, error, None))
